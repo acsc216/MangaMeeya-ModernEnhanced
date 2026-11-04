@@ -50,9 +50,13 @@
 
 ## 使用
 
+**仓库根目录就是完整的即开即用版本**：解压/克隆后直接运行 `MangaMeeya.exe` 即可，不需要额外安装或替换文件。
+
 1. 解压到任意目录（不要放在需要管理员权限的路径）。
 2. 直接运行 `MangaMeeya.exe`。
 3. 本仓库**不包含** `MangaMeeya.ini`、`历史.lst` 等用户文件；首次运行会自动生成默认配置。
+
+如果想恢复原版行为，用 `original/` 目录中的两个未修改二进制覆盖根目录同名文件即可（见 [original/README.md](original/README.md)）。
 
 ## 目录
 
@@ -64,7 +68,9 @@ SusiePlugin/          原版 Susie 插件
 AvisynthPlugin/       原版 Avisynth 插件
 docs/                 原版说明
 MangaMeeya 中文版说明.txt   原中文版作者说明
+original/             未修改的原版 MangaMeeya.exe / arc.dll（对照与回退用）
 patch-source/         本补丁的汇编源码、应用脚本与预编译补丁块
+SHA256SUMS.txt        补丁版与原版二进制的 SHA-256
 ```
 
 ## 重新打补丁
