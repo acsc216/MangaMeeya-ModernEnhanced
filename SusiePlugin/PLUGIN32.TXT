@@ -1,0 +1,114 @@
+Susie 32bit plug-in library Ver0.08
+
+	このアーカイブに含まれる *.SPI というファイルは、
+	画像ビューワSusie32 ver0.20以降で使うplug-inです。
+	Susie本体と同じディレクトリに置いて下さい。
+
+	このアーカイブファイルには次のファイルが含まれます。
+	  plugin32.txt	このファイル
+	  spi_api.txt	plug-in API解説
+	  ifjpeg.spi	JPEG plug-in
+	  ifgif.spi	GIF plug-in
+	  iftiff.spi	TIFF plug-in
+	  ifpi.spi	Pi plug-in
+	  ifmag.spi	MAG plug-in
+	  ifxld4.spi	XLD4(.Q4) plug-in
+	  ifpic.spi	PIC plug-in
+	  ifpic2.spi	PIC2 plug-in
+	  ifpict.spi	PICT plug-in
+	  lhasad.spi	LHa plug-in
+	  axzip.spi	Zip plug-in
+
+	制限事項等
+	  現状のplug-inには以下の制限があります。
+	  ・ifpic2.spi は複数の画像を含むpic2ファイルの場合、最初の画像しか
+	    展開出来ません。
+	  ・ifpic.spi は16色以下のpicファイルには対応していません。
+	  ・ifpict.spi が読み込めるPICT形式は限定されています。JPEG圧縮のPICT
+	    等は対応していません。
+
+・履歴
+	95/04/25  ver0.01
+		・16bit版から移植。
+
+	95/10/22  ver0.02
+		ifjpeg.spi ver0.04
+		・細かいバグ修正とわずかに高速化
+		ifpic.spi ver0.03
+		・スクエアPICに対応
+		ifpi.spi ver0.03
+		・256色奇数ドット幅の画像も展開できるようにした。
+		・16色奇数ドット幅の画像で展開に失敗するものがあるバグを修正。
+
+	96/04/04  ver0.03
+		ifjpeg.spi ver0.05
+		・一部のファイルで絵が壊れるバグを修正。
+		Lhasad.spi ver0.04
+		・一部のツールで作成したアーカイブで最初のファイルしか読めない
+		  問題を回避。
+		その他細かいバグ修正。
+
+	96/06/06  ver0.04
+		・win95で複数のアプリケーションから同時に利用できない問題を解決
+		axzip.spi 
+		・解凍に失敗する事があるバグを修正。
+
+	96/07/14  ver0.05
+		axzip.spi
+		・ファイル数が多いと一部ファイルが見えないバグを修正。
+		ifgif.spi
+		・ヘッダの画像サイズが0x0のものに対応。
+		・途中で切れているファイルの判定。
+		ifjpeg.spi
+		・途中で切れているファイルのサムネール作成時の問題を修正。
+
+	01/04/11  ver0.06
+		・バグ修正他
+
+	01/08/19  ver0.07
+		・いくつかのプラグインで定義されていないエラーコードを返す
+		  バグを修正
+		ifjpeg.spi
+		・画像の右端が崩れる事があるバグを修正
+
+	04/06/28 ver0.08
+		・コンパイラを Visual Studio .NET 2003 に変更
+		・GIF/TIFFプラグインを復活
+		lhasad.spi
+		・GetFileInfo,GetArchiveInfo の戻り値を修正。
+		ifgif.spi
+		・破損したファイルの読み込みで無限ループに入ることがある問題を
+		  修正
+
+・plug-inの利用と転載について。
+	plug-in はSusie以外のアプリケーションからも使えます。
+	詳しくは同梱のAPI仕様を見て下さい。
+	ただし、このパッケージに含まれるplug-inは他のアプリケーションにバンド
+	ルしたかたちでは配布しないでください。
+	このアーカイブを別途ダウンロード出来るように入手方法をドキュメントに
+	記載し、必要ならこのまま転載するようにしてださい。
+
+	このプログラムはフリーウェアです。
+	このプログラムの使用に起因するいかなる事態も責任を負いかねます。
+	通信と個人的な手渡しによる転載、流通に関しては内容の改変等が無い限り
+	制限はありません。
+	それ以外の方法による流通（雑誌、書籍等の付録ディスク、CD-ROM等への
+	収録）に関しては別途条件を考えますのでお問い合わせ下さい。
+
+	利用に関しては個人的な利用、業務での利用ともに対価を求めることはあり
+	ません。
+
+・最後に。
+	axzip.spi の解凍ルーティンの一部(inflate,explode)は
+	Info-ZIP group の公開しているコードを含んでいます。
+	Info-ZIP group のオリジナルのソースコードは無料で配布されています。
+	http://www.cdrom.com/pub/infozip/
+	ftp://ftp.cdrom.com/pub/infozip/
+
+	SusieとPlug-Inの最新版は
+		http://www.digitalpad.co.jp/~takechin/
+	で手に入ります。
+	使用上の問題、疑問点などの問い合わせには、できるだけwebの掲示板を
+	利用してください。
+
+		竹村嘉人 (たけちん)

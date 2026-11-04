@@ -1,0 +1,12 @@
+# Per-user files created by MangaMeeya — never commit
+MangaMeeya.ini
+MangaMeeya (漫画专用).ini
+*.lst
+*.lst.bak
+
+# Local backups / build outputs
+备份_原版_*/
+*.patched
+*.laa
+__pycache__/
+*.pyc
