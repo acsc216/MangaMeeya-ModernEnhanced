@@ -19,7 +19,8 @@ MangaMeeya 7.4 是 2006 年的 32 位程序。它在以下几类场景会失败�
 - 2GB 以上的 ZIP：只列出前 2GB 内的文件，之后全部丢失；
 - 4GB 以上的 ZIP：直接提示“没有可以读入的文件”；
 - 超大图片：标题显示 `Scale=0%`，图片不显示；
-- 文件名含当前系统代码页无法表示的字符（例如简体中文 Windows 下的日文「・」U+30FB）：字符被转换成 `?`，程序提示“无效路径”，文件无法打开。
+- 文件名含当前系统代码页无法表示的字符（例如简体中文 Windows 下的日文「・」U+30FB）：字符被转换成 `?`，程序提示“无效路径”，文件无法打开；
+- 以 `.txt` 文本作为页面的压缩包（例如带 BepInEx 本地化文本的模组包）在“预读 2 页以上”（`PrepageForwardNum=2`）时直接崩溃退出（0xC0000005）。
 
 本仓库修复了这些问题，并提供**即开即用**的完整程序。
 
@@ -59,6 +60,19 @@ MangaMeeya 的老代码只调用 ANSI 版本（A 后缀）的 Win32 API。文件
 
 > 界面标题与列表仍然按 ANSI 显示，因此特殊字符会显示为 `?`（或压缩包内条目的乱码）。这是程序内部字符串仍为 ANSI 导致的显示问题；本修复解决的是“能否打开”。
 
+#### 4. MangaMeeya.exe — 文本页扫描越界
+
+以 `.txt` 文件作为页面的压缩包（例如包含 BepInEx 本地化文本的模组包）在 `PrepageForwardNum=2`（预读 2 页）时会直接崩溃退出。原因是文本渲染函数 `sub_453040` 的行扫描循环：
+
+- 在检查下标是否到达缓冲区长度**之前**就先读取 `buffer[index]`；
+- 结束判断使用 `index == length`（等于），而不是“大于等于”。
+
+当文本末尾是多字节字符的首字节（如 UTF-8 韩文/日文的某个高位字节）时，下标会一次加 2，跳过“等于长度”的判断；之后 `index` 永远不再等于长度，循环便越过缓冲区继续扫描，直到读到未映射的页（0xC0000005）。是否崩溃取决于文本内容、堆布局和预读页数，因此同一个包在默认 `PrepageForwardNum=1` 时可能只是翻到某一页才崩。
+
+修复方式：在 `.text` 末尾的空白区写入一段检查，在读取前判断 `index >= length`；越界时把下标夹到长度并跳到正常的文本结束分支。原位置用 5 字节 `jmp` 跳入补丁代码。未修改入口点，也不影响正常文本的排版结果。
+
+> 验证：`[HS2] Next-Gen Skin v1.85` 这类含 3 个本地化 `.txt` 的模组包在 `PrepageForwardNum=2` 下不再崩溃，并可以正常翻到第 3 页（韩文）；以 UTF-8 韩文/日文、以多字节首字节结尾的文本为页面的测试包也均正常。
+
 ### 已验证场景
 
 | 场景 | 结果 |
@@ -76,6 +90,8 @@ MangaMeeya 的老代码只调用 ANSI 版本（A 后缀）的 Win32 API。文件
 | 目录名含 `・` 的图片文件夹 / 直接打开其中的图片 | 正常打开 |
 | 多级目录（父、子目录均含 `・`）；特殊目录内放普通 ZIP | 正常打开 |
 | ZIP 条目名含 `・`（UTF-8 标记） | 正常解码；标题中的条目名可能乱码（arc.dll 按 ANSI / Shift-JIS 解读，属另一问题） |
+| `[HS2] Next-Gen Skin` 模组 ZIP（3 个本地化 txt，预读 2 页） | 正常列出 3 页，不再崩溃；可翻到第 3 页（韩文） |
+| txt 页面为 UTF-8 韩文/日文、末尾为多字节首字节、超长单行等 | 正常渲染，不再越界 |
 
 ### 已知限制
 
@@ -85,6 +101,7 @@ MangaMeeya 的老代码只调用 ANSI 版本（A 后缀）的 Win32 API。文件
 - `mmunicode.dll` 必须与 `MangaMeeya.exe` 放在同一目录。缺失时 Windows 会提示找不到 DLL，程序无法启动。
 - 特殊字符修复只处理“文件名/目录名在当前 ANSI 代码页下不可表示”的情况；程序内部的 ANSI 字符串没有改成 Unicode，因此界面上的特殊字符仍显示为 `?`。
 - `mmunicode.dll` 在进程内挂钩文件 API，少数安全软件可能将其误报；源码公开，可自行审阅或重新编译。
+- 文本页越界修复针对已复现的 `sub_453040` 行扫描路径；其他文本排版分支未单独做模糊测试。
 
 ### 使用（即开即用）
 
@@ -114,7 +131,7 @@ SHA256SUMS.txt        补丁版与原版二进制的 SHA-256
 
 ### 重新打补丁
 
-见 [patch-source/README.md](patch-source/README.md)。需要 Python 3；重新汇编 `arc.dll` 补丁需要 NASM；重新编译 `mmunicode.dll` 需要 32 位（x86）MSVC 或 MinGW 工具链。
+见 [patch-source/README.md](patch-source/README.md)。需要 Python 3；重新汇编 `arc.dll` 补丁需要 NASM；重新编译 `mmunicode.dll` 需要 32 位（x86）MSVC 或 MinGW 工具链。文本页崩溃补丁仅修改 `MangaMeeya.exe` 的机器码，Python 即可完成。
 
 ### 隐私
 
@@ -140,7 +157,8 @@ MangaMeeya 7.4 is a 32-bit application from 2006. It fails on:
 - ZIP archives **≥ 2GB** — only entries before the 2GB boundary are listed;
 - ZIP64 archives **≥ 4GB** — the app reports “no readable files”;
 - images whose decoded DIB exceeds roughly **1.5GB** — the title shows `Scale=0%` and nothing is displayed;
-- file names containing characters the active ANSI code page cannot represent (for example U+30FB KATAKANA MIDDLE DOT “・” on a Simplified Chinese / CP936 system) — the character becomes `?` and the app reports an invalid path.
+- file names containing characters the active ANSI code page cannot represent (for example U+30FB KATAKANA MIDDLE DOT “・” on a Simplified Chinese / CP936 system) — the character becomes `?` and the app reports an invalid path;
+- archives whose pages are `.txt` files (for example mod packs containing BepInEx localization text) — the app crashes with 0xC0000005 when two or more pages are prefetched (`PrepageForwardNum=2`).
 
 This repository fixes those issues and ships a **ready-to-run** build.
 
@@ -180,6 +198,19 @@ This covers files, folders, drag-and-drop, file dialogs, command lines and histo
 
 > Window titles and lists still render ANSI, so the special characters appear as `?` (or as mojibake for archive entry names). That is a display-only consequence of the program's internal ANSI strings; this fix is about being able to open the file.
 
+#### 4. MangaMeeya.exe — text-page scanner overrun
+
+Archives whose pages are `.txt` files (for example mod packs containing BepInEx localization text) crash with 0xC0000005 when `PrepageForwardNum=2` (two pages prefetched). The line scanner in the text renderer `sub_453040`:
+
+- reads `buffer[index]` **before** checking whether the index has reached the buffer length;
+- uses equality (`index == length`) rather than “greater or equal” as its end test.
+
+When the text ends with the first byte of a multi-byte character (common in UTF-8 Korean/Japanese), the index advances by two and skips the equality test. After that it never equals the length again, so the loop keeps scanning past the allocation until it touches an unmapped page (0xC0000005). Whether it crashes depends on the text bytes, heap layout and prefetch count, which is why the same archive may only crash when a particular page is reached with the default `PrepageForwardNum=1`.
+
+The patch puts a bounds check in the zero padding at the end of `.text`, in front of the read: if `index >= length`, clamp the index to the length and jump to the normal end-of-text branch. The original instruction becomes a 5-byte `jmp` into the patch. The entry point is untouched, and normal text layout is unchanged.
+
+> Verified: `[HS2] Next-Gen Skin v1.85` (three localization `.txt` pages) no longer crashes with two-page prefetch and page 3 (Korean) renders; synthetic UTF-8 Korean/Japanese pages, pages ending in a multi-byte lead byte, and very long single lines also render without crashing.
+
 ### Verified
 
 | Scenario | Result |
@@ -197,6 +228,8 @@ This covers files, folders, drag-and-drop, file dialogs, command lines and histo
 | Image folder whose directory name contains `・`; opening an image directly from it | Opens normally |
 | Nested directories where both parent and child contain `・`; ordinary ZIP inside such a folder | Opens normally |
 | ZIP entry names containing `・` (UTF-8 flag) | Decodes normally; entry names in the title may be mojibake (arc.dll interprets them as ANSI / Shift-JIS — a separate issue) |
+| `[HS2] Next-Gen Skin` mod ZIP (three localization txt pages, two-page prefetch) | All 3 pages listed, no crash; page 3 (Korean) renders |
+| UTF-8 Korean/Japanese txt pages, pages ending in a multi-byte lead byte, very long single lines | Render normally, no overrun |
 
 ### Known limitations
 
@@ -206,6 +239,7 @@ This covers files, folders, drag-and-drop, file dialogs, command lines and histo
 - `mmunicode.dll` must stay next to `MangaMeeya.exe`. If it is missing, Windows reports that the DLL cannot be found and the program does not start.
 - The special-character fix only addresses characters that are unrepresentable in the ANSI code page. The program's internal strings remain ANSI, so the UI still displays `?`; this is cosmetic. Characters that are illegal in NTFS file names are, of course, not handled.
 - `mmunicode.dll` hooks file APIs inside the process, so a few security products may flag it; the source is included and can be reviewed or rebuilt.
+- The text-page overrun fix targets the reproduced line-scanner path (`sub_453040`); other text layout branches were not separately fuzzed.
 
 ### Usage (ready to run)
 
@@ -235,7 +269,7 @@ SHA256SUMS.txt        SHA-256 of patched and original binaries
 
 ### Rebuilding the patches
 
-See [patch-source/README.md](patch-source/README.md). Python 3 is required; NASM is required only to reassemble the `.asm` files, and a 32-bit (x86) MSVC or MinGW toolchain is required to rebuild `mmunicode.dll`.
+See [patch-source/README.md](patch-source/README.md). Python 3 is required; NASM is required only to reassemble the `.asm` files, and a 32-bit (x86) MSVC or MinGW toolchain is required to rebuild `mmunicode.dll`. The text-page crash patch only rewrites machine code in `MangaMeeya.exe` and needs Python only.
 
 ### Privacy
 

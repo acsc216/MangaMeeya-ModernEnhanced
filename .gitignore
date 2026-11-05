@@ -8,6 +8,7 @@ MangaMeeya (漫画专用).ini
 备份_原版_*/
 *.patched
 *.laa
+*.txtfix
 *.obj
 *.lib
 *.exp

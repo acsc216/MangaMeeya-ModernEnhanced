@@ -13,6 +13,7 @@
 | `apply_patch.py` | 将三处补丁写入 `arc.dll` |
 | `patch_mangameeya_laa.py` | 设置 `MangaMeeya.exe` 的 LAA 标志 |
 | `patch_mangameeya_unicode.py` | 给 `MangaMeeya.exe` 增加 `mmunicode.dll` 导入（特殊字符文件名支持） |
+| `patch_mangameeya_txtcrash.py` | 修复文本页行扫描越界（`sub_453040`，预读 ≥2 页时崩溃） |
 | `unicode/mmunicode.c` | 文件名兼容层源码（32 位 DLL） |
 
 ## 应用补丁
@@ -26,12 +27,16 @@ python apply_patch.py ..\arc.dll ..\arc.dll.patched
 :: 2) MangaMeeya.exe（LAA）
 python patch_mangameeya_laa.py ..\MangaMeeya.exe ..\MangaMeeya.exe.laa
 
-:: 3) MangaMeeya.exe（新增 mmunicode.dll 导入；在 1/2 之后执行）
-python patch_mangameeya_unicode.py ..\MangaMeeya.exe.laa ..\MangaMeeya.exe
+:: 3) MangaMeeya.exe（文本页越界修复）
+python patch_mangameeya_txtcrash.py ..\MangaMeeya.exe.laa ..\MangaMeeya.exe.txtfix
+
+:: 4) MangaMeeya.exe（新增 mmunicode.dll 导入）
+python patch_mangameeya_unicode.py ..\MangaMeeya.exe.txtfix ..\MangaMeeya.exe
 ```
 
 `apply_patch.py` 会校验原版字节，只在原始 `arc.dll`（2006-07-19，229376 字节）上工作；已经打过补丁的文件会被拒绝。
 `patch_mangameeya_unicode.py` 通过新增 `.mmuimp` 节来定位，重复执行会被拒绝。
+`patch_mangameeya_txtcrash.py` 校验 `0x531E0` 处的原始指令与 `.text` 尾部空区，重复执行会被拒绝。三个 exe 补丁互不依赖，执行顺序可以互换。
 
 ## 重新编译 mmunicode.dll
 
@@ -66,6 +71,7 @@ nasm -f bin zip64_eocd_comment.asm   -o zip64_eocd_comment.bin
 | arc.dll | `0x09DAE` | `0x10009DAE` | EOCD 扫描分支的 ZIP64 处理 |
 | MangaMeeya.exe | `e_lfanew + 22` | — | PE FileHeader.Characteristics 置 `0x20` |
 | MangaMeeya.exe | 文件末尾 | 新节 `.mmuimp`（原 `SizeOfImage` 处） | 复制原导入描述符数组 + 新增 `mmunicode.dll!MMUInit`，并把 Import Directory 指向新数组 |
+| MangaMeeya.exe | `0x0531E0` | `0x4531E0` | 文本行扫描入口改为 5 字节 `jmp`，跳入 `0xE4600` 的越界检查代码 |
 
 arc.dll 的补丁代码写入 `.text` 尾部 `0x10029170`–`0x10029479` 的空白区；该范围在原节表 `SizeOfRawData` 内，不需要修改任何 PE 头。
 
@@ -79,3 +85,28 @@ arc.dll 的补丁代码写入 `.text` 尾部 `0x10029170`–`0x10029479` 的空�
 MangaMeeya 只使用 ANSI（A 后缀）API。当路径中的字符在当前 ANSI 代码页（简体中文为 CP936）中无法表示时，A 调用看到的路径里该字符会变成 `?`，于是 `CreateFileA` 等调用失败。
 
 DLL 在启动时挂钩主程序、`arc.dll` 与 Susie 插件的 IAT。原调用失败且路径含 `?` 时，它从根目录开始逐级枚举父目录，把每个条目的宽字符名按相同规则转换成 ANSI 后与请求名比较，从而还原出真实 Unicode 路径并改用 W API 重试。程序内部的 ANSI 字符串没有改变，因此界面上的特殊字符仍会显示为 `?`，但文件可以正常打开。
+
+## 文本页越界修复（patch_mangameeya_txtcrash.py）
+
+文本渲染函数 `sub_453040`（VA `0x453040`）的行扫描循环在读取 `buffer[index]` 之后才检查 `index == length`。当文本以多字节字符的首字节结尾时，下标一次加 2 会跳过这个“等于”判断，之后循环越过缓冲区继续读取，直到访问未映射页而崩溃（`0xC0000005`）。
+
+补丁在 RVA `0xE4600`（`.text` 的原始数据范围内、`VirtualSize` 之后的零填充区，页面已映射且可执行）写入：
+
+```asm
+mov esi, [esp+0x10]     ; this
+mov eax, [esi+0xD34]    ; length
+cmp ebx, eax
+jb  short below
+mov ebx, eax            ; 越界时夹到 length
+jmp 0x4534F7            ; 正常的文本结束分支
+below:
+mov ecx, [esp+0x14]     ; buffer
+mov al, [ebx+ecx]
+cmp al, 0Dh
+je  0x4534F3
+cmp al, 0Ah
+je  0x4534F3
+jmp 0x4531F7
+```
+
+原 `0x4531E0` 处的 `mov ecx,[esp+0x14]` 被替换为 `jmp 0x4E4600`。两个循环回跳目标（`0x4531E0`）及所有外部引用都会经过这段检查；`0x4531E4` 之后没有被其他代码直接跳入，因此替换是安全的。

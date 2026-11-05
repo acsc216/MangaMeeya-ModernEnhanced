@@ -12,7 +12,8 @@
 - 修改仅涉及：
   - `arc.dll` 的 ZIP64 解析逻辑（三处代码补丁）；
   - `MangaMeeya.exe` 的 PE `FileHeader.Characteristics` LAA 标志位；
-  - `MangaMeeya.exe` 的导入表（新增 `mmunicode.dll!MMUInit`，用于加载文件名兼容层）。
+  - `MangaMeeya.exe` 的导入表（新增 `mmunicode.dll!MMUInit`，用于加载文件名兼容层）；
+  - `MangaMeeya.exe` 文本页行扫描的越界检查（`.text` 末尾补丁代码 + 一处 5 字节跳转）。
 - 新增 `mmunicode.dll`（C 源码见 `patch-source/unicode/`），用于解决 ANSI 代码页无法表示的特殊字符文件名；它不修改任何原有代码，只在进程内挂钩文件相关的 ANSI API。
 - 未修改任何第三方插件的代码。
 
