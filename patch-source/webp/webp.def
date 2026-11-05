@@ -1,0 +1,7 @@
+LIBRARY webp.spi
+EXPORTS
+    GetPluginInfo=_GetPluginInfo@12
+    IsSupported=_IsSupported@8
+    GetPictureInfo=_GetPictureInfo@16
+    GetPicture=_GetPicture@28
+    GetPreview=_GetPreview@28

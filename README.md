@@ -20,7 +20,8 @@ MangaMeeya 7.4 是 2006 年的 32 位程序。它在以下几类场景会失败�
 - 4GB 以上的 ZIP：直接提示“没有可以读入的文件”；
 - 超大图片：标题显示 `Scale=0%`，图片不显示；
 - 文件名含当前系统代码页无法表示的字符（例如简体中文 Windows 下的日文「・」U+30FB）：字符被转换成 `?`，程序提示“无效路径”，文件无法打开；
-- 以 `.txt` 文本作为页面的压缩包（例如带 BepInEx 本地化文本的模组包）在“预读 2 页以上”（`PrepageForwardNum=2`）时直接崩溃退出（0xC0000005）。
+- 以 `.txt` 文本作为页面的压缩包（例如带 BepInEx 本地化文本的模组包）在“预读 2 页以上”（`PrepageForwardNum=2`）时直接崩溃退出（0xC0000005）；
+- 无法读取和显示 **WebP 图片**，含 WebP 条目的压缩包也会因没有解码器而无法正常显示。
 
 本仓库修复了这些问题，并提供**即开即用**的完整程序。
 
@@ -74,6 +75,17 @@ MangaMeeya 的老代码只调用 ANSI 版本（A 后缀）的 Win32 API。文件
 
 > 验证：`[HS2] Next-Gen Skin v1.85` 这类含 3 个本地化 `.txt` 的模组包在 `PrepageForwardNum=2` 下不再崩溃，并可以正常翻到第 3 页（韩文）；以 UTF-8 韩文/日文、以多字节首字节结尾的文本为页面的测试包也均正常。
 
+#### 5. SusiePlugin/webp.spi — WebP 支持
+
+MangaMeeya 7.4 本身没有 WebP 解码器。新增一个 32 位 Susie 图像插件 `SusiePlugin/webp.spi`：
+
+- 按 Susie `00IN` 导入插件接口实现 `GetPluginInfo` / `IsSupported` / `GetPictureInfo` / `GetPicture`；
+- 通过 **Windows Imaging Component（WIC）** 解码 WebP，因此支持独立 WebP 文件，也支持 ZIP/RAR 等压缩包内的 `.webp` 条目（由 arc 插件列出后交给本插件解码）；
+- 输出 24bpp 自下而上的 DIB，并按需保留第一帧（动画 WebP 只显示第一帧）；
+- WebP 的透明通道由插件**合成到白色背景**后再输出。MangaMeeya 的 Susie 图像路径只使用 RGB 通道，不会像内置 PNG/GIF 路径那样做逐像素 alpha 合成，因此透明区域会呈现为白底而不是穿透到软件背景。
+
+> 依赖：Windows 11 自带 WIC WebP 解码器；Windows 10 需要安装 Microsoft Store 的 “WebP Image Extensions”。插件放在 `SusiePlugin` 目录（即 `[Susie] PluginPath`），程序启动时自动加载。
+
 ### 已验证场景
 
 | 场景 | 结果 |
@@ -94,6 +106,10 @@ MangaMeeya 的老代码只调用 ANSI 版本（A 后缀）的 Win32 API。文件
 | 文件名同时含 `・` 和尾字节为 `0x5C` 的 GBK 字符（`診` → `D4 5C`） | 正常打开（44 页） |
 | `[HS2] Next-Gen Skin` 模组 ZIP（3 个本地化 txt，预读 2 页） | 正常列出 3 页，不再崩溃；可翻到第 3 页（韩文） |
 | txt 页面为 UTF-8 韩文/日文、末尾为多字节首字节、超长单行等 | 正常渲染，不再越界 |
+| 独立 `.webp` 文件（1920×1080 等） | 正常列出并显示 |
+| 仅含 WebP 的 ZIP / JPEG+WebP 混合 ZIP | 页数正确，WebP 页正常显示 |
+| 文件名/目录名含 `・` 的 WebP 文件与含 WebP 的 ZIP | 正常打开并显示 |
+| 含透明通道的 WebP | 正常显示（透明区域合成到白色背景） |
 
 ### 已知限制
 
@@ -104,6 +120,9 @@ MangaMeeya 的老代码只调用 ANSI 版本（A 后缀）的 Win32 API。文件
 - 特殊字符修复只处理“文件名/目录名在当前 ANSI 代码页下不可表示”的情况；程序内部的 ANSI 字符串没有改成 Unicode，因此界面上的特殊字符仍显示为 `?`。
 - `mmunicode.dll` 在进程内挂钩文件 API，少数安全软件可能将其误报；源码公开，可自行审阅或重新编译。
 - 文本页越界修复针对已复现的 `sub_453040` 行扫描路径；其他文本排版分支未单独做模糊测试。
+- WebP 解码依赖系统的 WIC WebP 编解码器。Windows 11 通常自带；Windows 10 如未安装 “WebP Image Extensions”，`webp.spi` 将无法解码并可能显示为空白。
+- 透明 WebP 会合成到白底（不会穿透到 MangaMeeya 的背景色）；动画 WebP 只显示第一帧。
+- 如果用户修改了 `[Susie] PluginPath`，需要把 `webp.spi` 复制到对应目录。
 
 ### 使用（即开即用）
 
@@ -122,18 +141,18 @@ MangaMeeya.exe        主程序（已开启 LAA，并导入 mmunicode.dll）
 mmunicode.dll         特殊字符文件名兼容层（新增）
 arc.dll               压缩包插件（已打 ZIP64 补丁）
 gif/jpg/png/jp2/pdf.dll
-SusiePlugin/          原版 Susie 插件
+SusiePlugin/          原版 Susie 插件 + 新增 webp.spi（WebP 解码）
 AvisynthPlugin/       原版 Avisynth 插件
 docs/                 原版说明
 MangaMeeya 中文版说明.txt   原中文版作者说明
 original/             未修改的原版 MangaMeeya.exe / arc.dll（对照与回退用）
-patch-source/         补丁源码、应用脚本与预编译补丁块（含 unicode/ 子目录）
+patch-source/         补丁源码、应用脚本与预编译补丁块（含 unicode/、webp/ 子目录）
 SHA256SUMS.txt        补丁版与原版二进制的 SHA-256
 ```
 
 ### 重新打补丁
 
-见 [patch-source/README.md](patch-source/README.md)。需要 Python 3；重新汇编 `arc.dll` 补丁需要 NASM；重新编译 `mmunicode.dll` 需要 32 位（x86）MSVC 或 MinGW 工具链。文本页崩溃补丁仅修改 `MangaMeeya.exe` 的机器码，Python 即可完成。
+见 [patch-source/README.md](patch-source/README.md)。需要 Python 3；重新汇编 `arc.dll` 补丁需要 NASM；重新编译 `mmunicode.dll` 或 `webp.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。文本页崩溃补丁仅修改 `MangaMeeya.exe` 的机器码，Python 即可完成。
 
 ### 隐私
 
@@ -160,7 +179,8 @@ MangaMeeya 7.4 is a 32-bit application from 2006. It fails on:
 - ZIP64 archives **≥ 4GB** — the app reports “no readable files”;
 - images whose decoded DIB exceeds roughly **1.5GB** — the title shows `Scale=0%` and nothing is displayed;
 - file names containing characters the active ANSI code page cannot represent (for example U+30FB KATAKANA MIDDLE DOT “・” on a Simplified Chinese / CP936 system) — the character becomes `?` and the app reports an invalid path;
-- archives whose pages are `.txt` files (for example mod packs containing BepInEx localization text) — the app crashes with 0xC0000005 when two or more pages are prefetched (`PrepageForwardNum=2`).
+- archives whose pages are `.txt` files (for example mod packs containing BepInEx localization text) — the app crashes with 0xC0000005 when two or more pages are prefetched (`PrepageForwardNum=2`);
+- **WebP images** cannot be read or displayed, and archives containing WebP entries do not render because there is no decoder.
 
 This repository fixes those issues and ships a **ready-to-run** build.
 
@@ -214,6 +234,17 @@ The patch puts a bounds check in the zero padding at the end of `.text`, in fron
 
 > Verified: `[HS2] Next-Gen Skin v1.85` (three localization `.txt` pages) no longer crashes with two-page prefetch and page 3 (Korean) renders; synthetic UTF-8 Korean/Japanese pages, pages ending in a multi-byte lead byte, and very long single lines also render without crashing.
 
+#### 5. SusiePlugin/webp.spi — WebP support
+
+MangaMeeya 7.4 has no WebP decoder. A 32-bit Susie image plug-in, `SusiePlugin/webp.spi`, is added:
+
+- implements the Susie `00IN` import-filter API (`GetPluginInfo` / `IsSupported` / `GetPictureInfo` / `GetPicture`);
+- decodes WebP through **Windows Imaging Component (WIC)**, so standalone `.webp` files and `.webp` entries inside ZIP/RAR archives (listed by the arc plug-in and handed to this decoder) are supported;
+- returns a 24bpp bottom-up DIB; animated WebP shows the first frame only;
+- WebP alpha is **flattened onto white** by the plug-in. MangaMeeya's Susie image path only uses the RGB channels and, unlike the built-in PNG/GIF paths, does not composite per-pixel alpha, so transparent areas appear as a white background rather than the viewer's background colour.
+
+> Requirement: Windows 11 includes the WIC WebP codec; on Windows 10 install “WebP Image Extensions” from the Microsoft Store. The plug-in lives in the `SusiePlugin` folder (`[Susie] PluginPath`) and is loaded at startup.
+
 ### Verified
 
 | Scenario | Result |
@@ -234,6 +265,10 @@ The patch puts a bounds check in the zero padding at the end of `.text`, in fron
 | File name containing both `・` and a GBK character whose trail byte is `0x5C` (`診` → `D4 5C`) | Opens normally (44 pages) |
 | `[HS2] Next-Gen Skin` mod ZIP (three localization txt pages, two-page prefetch) | All 3 pages listed, no crash; page 3 (Korean) renders |
 | UTF-8 Korean/Japanese txt pages, pages ending in a multi-byte lead byte, very long single lines | Render normally, no overrun |
+| Standalone `.webp` files (1920×1080 etc.) | Listed and displayed normally |
+| WebP-only ZIP / mixed JPEG+WebP ZIP | Correct page count; WebP pages render normally |
+| WebP files and WebP ZIPs whose names contain `・` | Open and render normally |
+| WebP with an alpha channel | Displays normally (alpha flattened onto white) |
 
 ### Known limitations
 
@@ -244,6 +279,9 @@ The patch puts a bounds check in the zero padding at the end of `.text`, in fron
 - The special-character fix only addresses characters that are unrepresentable in the ANSI code page. The program's internal strings remain ANSI, so the UI still displays `?`; this is cosmetic. Characters that are illegal in NTFS file names are, of course, not handled.
 - `mmunicode.dll` hooks file APIs inside the process, so a few security products may flag it; the source is included and can be reviewed or rebuilt.
 - The text-page overrun fix targets the reproduced line-scanner path (`sub_453040`); other text layout branches were not separately fuzzed.
+- WebP decoding depends on the system WIC WebP codec. Windows 11 normally includes it; on Windows 10 without “WebP Image Extensions” `webp.spi` cannot decode and may show a blank page.
+- Transparent WebP is flattened onto white (it does not show the viewer background); animated WebP shows only the first frame.
+- If `[Susie] PluginPath` is changed, `webp.spi` must be copied to that folder.
 
 ### Usage (ready to run)
 
@@ -262,18 +300,18 @@ MangaMeeya.exe        main executable (LAA enabled, imports mmunicode.dll)
 mmunicode.dll         special-character file name compatibility layer (new)
 arc.dll               archive plugin (ZIP64 patched)
 gif/jpg/png/jp2/pdf.dll
-SusiePlugin/          original Susie plugins
+SusiePlugin/          original Susie plugins + new webp.spi (WebP decoder)
 AvisynthPlugin/       original Avisynth plugins
 docs/                 original documentation
 MangaMeeya 中文版说明.txt   original Chinese edition readme
 original/             unmodified MangaMeeya.exe / arc.dll (reference and rollback)
-patch-source/         patch sources, apply scripts and prebuilt blobs (incl. unicode/)
+patch-source/         patch sources, apply scripts and prebuilt blobs (incl. unicode/, webp/)
 SHA256SUMS.txt        SHA-256 of patched and original binaries
 ```
 
 ### Rebuilding the patches
 
-See [patch-source/README.md](patch-source/README.md). Python 3 is required; NASM is required only to reassemble the `.asm` files, and a 32-bit (x86) MSVC or MinGW toolchain is required to rebuild `mmunicode.dll`. The text-page crash patch only rewrites machine code in `MangaMeeya.exe` and needs Python only.
+See [patch-source/README.md](patch-source/README.md). Python 3 is required; NASM is required only to reassemble the `.asm` files, and a 32-bit (x86) MSVC or MinGW toolchain is required to rebuild `mmunicode.dll` or `webp.spi`. The text-page crash patch only rewrites machine code in `MangaMeeya.exe` and needs Python only.
 
 ### Privacy
 

@@ -15,10 +15,11 @@
 | `patch_mangameeya_unicode.py` | 给 `MangaMeeya.exe` 增加 `mmunicode.dll` 导入（特殊字符文件名支持） |
 | `patch_mangameeya_txtcrash.py` | 修复文本页行扫描越界（`sub_453040`，预读 ≥2 页时崩溃） |
 | `unicode/mmunicode.c` | 文件名兼容层源码（32 位 DLL） |
+| `webp/webp.c`、`webp/webp.def` | WebP Susie 图像插件源码（32 位，WIC 解码） |
 
 ## 应用补丁
 
-需要 Python 3；重新汇编 `arc.dll` 补丁时才需要 NASM；重新编译 `mmunicode.dll` 需要 32 位（x86）MSVC 或 MinGW 工具链。
+需要 Python 3；重新汇编 `arc.dll` 补丁时才需要 NASM；重新编译 `mmunicode.dll` 或 `webp.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。
 
 ```bat
 :: 1) arc.dll（ZIP64）
@@ -85,6 +86,16 @@ arc.dll 的补丁代码写入 `.text` 尾部 `0x10029170`–`0x10029479` 的空�
 MangaMeeya 只使用 ANSI（A 后缀）API。当路径中的字符在当前 ANSI 代码页（简体中文为 CP936）中无法表示时，A 调用看到的路径里该字符会变成 `?`，于是 `CreateFileA` 等调用失败。
 
 DLL 在启动时挂钩主程序、`arc.dll` 与 Susie 插件的 IAT。原调用失败且路径含 `?` 时，它从根目录开始逐级枚举父目录，把每个条目的宽字符名按相同规则转换成 ANSI 后与请求名比较，从而还原出真实 Unicode 路径并改用 W API 重试。扫描 ANSI 路径时按 `IsDBCSLeadByteEx(CP_ACP, …)` 逐字符前进，不会把双字节字符的尾字节 `0x5C`（`\`）误当成目录分隔符（例如 `診` 在 GBK 中是 `D4 5C`）。程序内部的 ANSI 字符串没有改变，因此界面上的特殊字符仍会显示为 `?`，但文件可以正常打开。
+
+## 重新编译 webp.spi
+
+`webp/` 是一个 32 位 Susie 图像插件，通过 Windows Imaging Component（WIC）解码 WebP。它不包含任何第三方解码库，依赖系统的 WIC WebP 编解码器（Windows 11 自带；Windows 10 可安装“WebP Image Extensions”）。
+
+```bat
+cl /nologo /LD /MT /O2 /W0 webp.c /link /DEF:webp.def windowscodecs.lib ole32.lib user32.lib /OUT:webp.spi
+```
+
+把 `webp.spi` 复制到 `SusiePlugin\`（即 `[Susie] PluginPath`）即可。插件注册 `*.WEBP`，`GetPicture` 返回 24bpp 自下而上的 DIB；透明通道在插件内合成到白色背景（MangaMeeya 的 Susie 图像路径不做逐像素 alpha 合成），动画 WebP 只显示第一帧。
 
 ## 文本页越界修复（patch_mangameeya_txtcrash.py）
 
