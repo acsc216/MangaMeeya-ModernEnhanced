@@ -58,6 +58,16 @@ static void logf(const char* fmt, ...);
 
 static BOOL is_sep(char c) { return c == '\\' || c == '/'; }
 
+/* Length in bytes of one character in the ANSI path.  Must be used whenever
+   scanning an ANSI path: in DBCS code pages (e.g. CP936) a double-byte
+   character's trail byte can be 0x5C ('\'), which is not a separator. */
+static int ansi_charlen(const char* s)
+{
+    if (s[0] && s[1] && IsDBCSLeadByteEx(CP_ACP, (BYTE)(unsigned char)s[0]))
+        return 2;
+    return 1;
+}
+
 static BOOL path_has_lossy(const char* s)
 {
     return s != NULL && strchr(s, '?') != NULL;
@@ -123,12 +133,12 @@ static BOOL resolve_ansi_path(const char* ansi, WCHAR* out, int cap)
         int l1, l2, w1, w2, pos;
         const char* s2;
 
-        while (*q && !is_sep(*q)) q++;
+        while (*q && !is_sep(*q)) q += ansi_charlen(q);
         l1 = (int)(q - s1);
         if (!*q) return FALSE;
         s2 = q + 1;
         q = s2;
-        while (*q && !is_sep(*q)) q++;
+        while (*q && !is_sep(*q)) q += ansi_charlen(q);
         l2 = (int)(q - s2);
         if (l1 <= 0 || l2 <= 0) return FALSE;
 
@@ -164,7 +174,7 @@ static BOOL resolve_ansi_path(const char* ansi, WCHAR* out, int cap)
         if (!*p) break;
 
         e = p;
-        while (*e && !is_sep(*e)) e++;
+        while (*e && !is_sep(*e)) e += ansi_charlen(e);
         clen = (int)(e - p);
         if (clen <= 0 || clen >= (int)sizeof(comp)) return FALSE;
         memcpy(comp, p, clen);
@@ -400,8 +410,10 @@ static BOOL pattern_to_wide(const char* pat, WCHAR* out, int cap)
     WCHAR wleaf[1024];
     WCHAR wdir[2048];
 
-    for (q = pat; *q; q++)
+    for (q = pat; *q; ) {
         if (is_sep(*q)) leaf = q + 1;
+        q += ansi_charlen(q);
+    }
 
     if (strchr(leaf, '?') && !strchr(leaf, '*'))
         return resolve_ansi_path(pat, out, cap);

@@ -54,6 +54,7 @@ MangaMeeya 的老代码只调用 ANSI 版本（A 后缀）的 Win32 API。文件
 - 在主程序导入表中新增一项 `mmunicode.dll!MMUInit`，由 Windows 加载器在程序启动前加载；
 - 兼容层在进程内挂钩主程序、`arc.dll` 及 Susie 图片插件的导入表（IAT），覆盖 `CreateFileA`、`GetFileAttributesA`、`GetFileAttributesExA`、`SetCurrentDirectoryA`、`DeleteFileA`、`MoveFileA`、`CopyFileA`、`CreateDirectoryA`、`RemoveDirectoryA`、`GetShortPathNameA`、`FindFirstFileA/FindNextFileA`；
 - 原 ANSI 调用失败且路径中含 `?` 时，兼容层从根目录开始逐级扫描父目录，把每个条目的宽字符名按同样规则转换成 ANSI（有损）后与请求中的名字比对，还原真实 Unicode 路径，再用 W 版本 API 重试；
+- 扫描 ANSI 路径时按当前代码页的双字节规则逐字符前进，不会把 GBK/Shift-JIS 双字节字符的尾字节 `0x5C`（`\`）误当成目录分隔符（例如 `診` 的 GBK 编码是 `D4 5C`，旧版本解析这类文件名会错位）；
 - 不修改入口点、不改动任何原有代码字节、不修改系统区域设置或代码页。
 
 这样既能打开文件名/目录名含特殊字符的 ZIP、图片和文件夹，也能处理拖放、文件对话框、命令行和历史记录里保存的有损路径。
@@ -90,6 +91,7 @@ MangaMeeya 的老代码只调用 ANSI 版本（A 后缀）的 Win32 API。文件
 | 目录名含 `・` 的图片文件夹 / 直接打开其中的图片 | 正常打开 |
 | 多级目录（父、子目录均含 `・`）；特殊目录内放普通 ZIP | 正常打开 |
 | ZIP 条目名含 `・`（UTF-8 标记） | 正常解码；标题中的条目名可能乱码（arc.dll 按 ANSI / Shift-JIS 解读，属另一问题） |
+| 文件名同时含 `・` 和尾字节为 `0x5C` 的 GBK 字符（`診` → `D4 5C`） | 正常打开（44 页） |
 | `[HS2] Next-Gen Skin` 模组 ZIP（3 个本地化 txt，预读 2 页） | 正常列出 3 页，不再崩溃；可翻到第 3 页（韩文） |
 | txt 页面为 UTF-8 韩文/日文、末尾为多字节首字节、超长单行等 | 正常渲染，不再越界 |
 
@@ -192,6 +194,7 @@ The fix is a small compatibility layer, `mmunicode.dll`, loaded with the program
 - a new import, `mmunicode.dll!MMUInit`, is added to the executable's import table, so the Windows loader loads the DLL before the program starts;
 - the DLL patches the IAT of the main executable, `arc.dll` and the Susie image plugins, covering `CreateFileA`, `GetFileAttributesA`, `GetFileAttributesExA`, `SetCurrentDirectoryA`, `DeleteFileA`, `MoveFileA`, `CopyFileA`, `CreateDirectoryA`, `RemoveDirectoryA`, `GetShortPathNameA`, and `FindFirstFileA/FindNextFileA`;
 - when an ANSI call fails on a path containing `?`, the DLL walks the path component by component, enumerates each parent directory and matches entries by their lossy ANSI conversion, reconstructs the real Unicode path, and retries through the W API;
+- ANSI paths are scanned character by character using the active code page's DBCS rules, so a double-byte character's trail byte `0x5C` (`\`) is not mistaken for a directory separator (for example `診` is `D4 5C` in GBK; the earlier build mis-parsed such names);
 - the entry point, existing code bytes, the system locale and the system code page are not modified.
 
 This covers files, folders, drag-and-drop, file dialogs, command lines and history entries that were previously stored as lossy ANSI paths.
@@ -228,6 +231,7 @@ The patch puts a bounds check in the zero padding at the end of `.text`, in fron
 | Image folder whose directory name contains `・`; opening an image directly from it | Opens normally |
 | Nested directories where both parent and child contain `・`; ordinary ZIP inside such a folder | Opens normally |
 | ZIP entry names containing `・` (UTF-8 flag) | Decodes normally; entry names in the title may be mojibake (arc.dll interprets them as ANSI / Shift-JIS — a separate issue) |
+| File name containing both `・` and a GBK character whose trail byte is `0x5C` (`診` → `D4 5C`) | Opens normally (44 pages) |
 | `[HS2] Next-Gen Skin` mod ZIP (three localization txt pages, two-page prefetch) | All 3 pages listed, no crash; page 3 (Korean) renders |
 | UTF-8 Korean/Japanese txt pages, pages ending in a multi-byte lead byte, very long single lines | Render normally, no overrun |
 
