@@ -21,7 +21,8 @@ MangaMeeya 7.4 是 2006 年的 32 位程序。它在以下几类场景会失败�
 - 超大图片：标题显示 `Scale=0%`，图片不显示；
 - 文件名含当前系统代码页无法表示的字符（例如简体中文 Windows 下的日文「・」U+30FB）：字符被转换成 `?`，程序提示“无效路径”，文件无法打开；
 - 以 `.txt` 文本作为页面的压缩包（例如带 BepInEx 本地化文本的模组包）在“预读 2 页以上”（`PrepageForwardNum=2`）时直接崩溃退出（0xC0000005）；
-- 无法读取和显示 **WebP 图片**，含 WebP 条目的压缩包也会因没有解码器而无法正常显示。
+- 无法读取和显示 **WebP 图片**，含 WebP 条目的压缩包也会因没有解码器而无法正常显示；
+- 在 Windows 11 上，“文件关联设置”里的 **Explorer 右键菜单注册会静默失败**（普通权限进程无法写 `HKEY_CLASSES_ROOT`，程序清单又禁用了 UAC 虚拟化）。
 
 本仓库修复了这些问题，并提供**即开即用**的完整程序。
 
@@ -86,6 +87,19 @@ MangaMeeya 7.4 本身没有 WebP 解码器。新增一个 32 位 Susie 图像插
 
 > 依赖：Windows 11 自带 WIC WebP 解码器；Windows 10 需要安装 Microsoft Store 的 “WebP Image Extensions”。插件放在 `SusiePlugin` 目录（即 `[Susie] PluginPath`），程序启动时自动加载。
 
+#### 6. MangaMeeya.exe — Explorer 右键菜单按用户注册
+
+Windows 7 以后，普通权限进程不能写 `HKEY_CLASSES_ROOT`；MangaMeeya 的程序清单（空 `<assembly>`）又禁用了 UAC 虚拟化。因此“文件关联设置”里的右键菜单注册在 Win11 上会**静默失败**：对话框看似正常关闭，但注册表里没有生成任何条目。
+
+修复方式：把三个注册表辅助函数（检查 / 写入 / 删除）替换为写入 **HKCU\Software\Classes** 的实现：
+
+- `Folder` → `HKCU\Software\Classes\Folder\shell\用MangaMeeya打开\command`
+- `.zip/.rar/.lzh/.cbz/.cbr/.cbl/.jpg/.png/.gif/.bmp` → `HKCU\Software\Classes\SystemFileAssociations\<ext>\shell\用MangaMeeya打开\command`
+
+这样不需要管理员权限，Explorer 会读取当前用户的类注册。列表第 5 项（显示为 `....`）不注册。
+
+> **Win11 菜单位置**：Windows 11 的默认右键菜单只显示新式菜单项；所有旧式 shell 项（包括本补丁注册的）都在 **“显示更多选项”**（Shift+F10）里。要把条目放进一级菜单，需要带 `IExplorerCommand` 的 MSIX/sparse package，本补丁不涉及。
+
 ### 已验证场景
 
 | 场景 | 结果 |
@@ -110,6 +124,10 @@ MangaMeeya 7.4 本身没有 WebP 解码器。新增一个 32 位 Susie 图像插
 | 仅含 WebP 的 ZIP / JPEG+WebP 混合 ZIP | 页数正确，WebP 页正常显示 |
 | 文件名/目录名含 `・` 的 WebP 文件与含 WebP 的 ZIP | 正常打开并显示 |
 | 含透明通道的 WebP | 正常显示（透明区域合成到白色背景） |
+| 文件关联设置勾选 `Folder` / `.zip` 并确定 | `HKCU\Software\Classes\...` 生成 command，Shell 能枚举到“用MangaMeeya打开” |
+| 勾选 `.jpg` / `.bmp` 等图片类型 | `SystemFileAssociations\<ext>` 下生成，对应文件右键菜单可见 |
+| 取消注册 | 对应 HKCU 键被删除 |
+| Win11 默认右键菜单 | 条目位于“显示更多选项”（Shift+F10）中 |
 
 ### 已知限制
 
@@ -123,6 +141,9 @@ MangaMeeya 7.4 本身没有 WebP 解码器。新增一个 32 位 Susie 图像插
 - WebP 解码依赖系统的 WIC WebP 编解码器。Windows 11 通常自带；Windows 10 如未安装 “WebP Image Extensions”，`webp.spi` 将无法解码并可能显示为空白。
 - 透明 WebP 会合成到白底（不会穿透到 MangaMeeya 的背景色）；动画 WebP 只显示第一帧。
 - 如果用户修改了 `[Susie] PluginPath`，需要把 `webp.spi` 复制到对应目录。
+- 右键菜单的注册写入 `HKCU\Software\Classes`，只对当前用户生效；在 Win11 默认菜单中位于“显示更多选项”。进入一级菜单需要 MSIX/IExplorerCommand 包，本补丁未实现。
+- 文件关联设置列表第 5 项（显示为 `....`）不注册（原版会生成无意义的 `HKCR\....`）。
+- IE 右键菜单（MenuExt）仍按原有逻辑写入 `HKCU\Software\Microsoft\Internet Explorer\MenuExt`；Edge 不使用该位置，因此只在旧版 IE 中有效。
 
 ### 使用（即开即用）
 
@@ -146,13 +167,13 @@ AvisynthPlugin/       原版 Avisynth 插件
 docs/                 原版说明
 MangaMeeya 中文版说明.txt   原中文版作者说明
 original/             未修改的原版 MangaMeeya.exe / arc.dll（对照与回退用）
-patch-source/         补丁源码、应用脚本与预编译补丁块（含 unicode/、webp/ 子目录）
+patch-source/         补丁源码、应用脚本与预编译补丁块（含 unicode/、webp/、shellmenu/ 子目录）
 SHA256SUMS.txt        补丁版与原版二进制的 SHA-256
 ```
 
 ### 重新打补丁
 
-见 [patch-source/README.md](patch-source/README.md)。需要 Python 3；重新汇编 `arc.dll` 补丁需要 NASM；重新编译 `mmunicode.dll` 或 `webp.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。文本页崩溃补丁仅修改 `MangaMeeya.exe` 的机器码，Python 即可完成。
+见 [patch-source/README.md](patch-source/README.md)。需要 Python 3；重新汇编 `arc.dll` 补丁需要 NASM；重新编译 `mmunicode.dll` 或 `webp.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。文本页崩溃补丁和右键菜单补丁仅修改 `MangaMeeya.exe` 的机器码，Python 即可完成（右键菜单补丁的 `.bin` 已附带；修改汇编时才需要 NASM）。
 
 ### 隐私
 
@@ -180,7 +201,8 @@ MangaMeeya 7.4 is a 32-bit application from 2006. It fails on:
 - images whose decoded DIB exceeds roughly **1.5GB** — the title shows `Scale=0%` and nothing is displayed;
 - file names containing characters the active ANSI code page cannot represent (for example U+30FB KATAKANA MIDDLE DOT “・” on a Simplified Chinese / CP936 system) — the character becomes `?` and the app reports an invalid path;
 - archives whose pages are `.txt` files (for example mod packs containing BepInEx localization text) — the app crashes with 0xC0000005 when two or more pages are prefetched (`PrepageForwardNum=2`);
-- **WebP images** cannot be read or displayed, and archives containing WebP entries do not render because there is no decoder.
+- **WebP images** cannot be read or displayed, and archives containing WebP entries do not render because there is no decoder;
+- on Windows 11 the **Explorer context-menu registration** in “File association settings” fails silently (a standard process cannot write `HKEY_CLASSES_ROOT`, and the app's manifest disables UAC virtualisation).
 
 This repository fixes those issues and ships a **ready-to-run** build.
 
@@ -245,6 +267,19 @@ MangaMeeya 7.4 has no WebP decoder. A 32-bit Susie image plug-in, `SusiePlugin/w
 
 > Requirement: Windows 11 includes the WIC WebP codec; on Windows 10 install “WebP Image Extensions” from the Microsoft Store. The plug-in lives in the `SusiePlugin` folder (`[Susie] PluginPath`) and is loaded at startup.
 
+#### 6. MangaMeeya.exe — per-user Explorer context menu
+
+Since Windows 7, a non-elevated process cannot write `HKEY_CLASSES_ROOT`, and MangaMeeya's empty `<assembly>` manifest disables UAC virtualisation. As a result, the Explorer context-menu registration in “File association settings” **fails silently** on Windows 11: the dialog closes normally but no registry entries are created.
+
+The three registry helpers (check / set / delete) are replaced with implementations that write to **HKCU\Software\Classes**:
+
+- `Folder` → `HKCU\Software\Classes\Folder\shell\用MangaMeeya打开\command`
+- `.zip/.rar/.lzh/.cbz/.cbr/.cbl/.jpg/.png/.gif/.bmp` → `HKCU\Software\Classes\SystemFileAssociations\<ext>\shell\用MangaMeeya打开\command`
+
+No administrator rights are required, and Explorer honours the per-user class registration. The fifth list entry (shown as `....`) is not registered.
+
+> **Placement on Windows 11**: the default Windows 11 context menu only shows the new-style commands; all legacy shell verbs (including these) are under **“Show more options”** (Shift+F10). Putting an entry in the top-level menu requires an MSIX/sparse package with an `IExplorerCommand`; this patch does not implement that.
+
 ### Verified
 
 | Scenario | Result |
@@ -269,6 +304,10 @@ MangaMeeya 7.4 has no WebP decoder. A 32-bit Susie image plug-in, `SusiePlugin/w
 | WebP-only ZIP / mixed JPEG+WebP ZIP | Correct page count; WebP pages render normally |
 | WebP files and WebP ZIPs whose names contain `・` | Open and render normally |
 | WebP with an alpha channel | Displays normally (alpha flattened onto white) |
+| Register `Folder` / `.zip` in File association settings | `HKCU\Software\Classes\...` command created; the shell enumerates “用MangaMeeya打开” |
+| Register `.jpg` / `.bmp` and other image types | Created under `SystemFileAssociations\<ext>`; visible in the file context menu |
+| Unregister | The corresponding HKCU keys are removed |
+| Windows 11 default context menu | The entry is under “Show more options” (Shift+F10) |
 
 ### Known limitations
 
@@ -282,6 +321,9 @@ MangaMeeya 7.4 has no WebP decoder. A 32-bit Susie image plug-in, `SusiePlugin/w
 - WebP decoding depends on the system WIC WebP codec. Windows 11 normally includes it; on Windows 10 without “WebP Image Extensions” `webp.spi` cannot decode and may show a blank page.
 - Transparent WebP is flattened onto white (it does not show the viewer background); animated WebP shows only the first frame.
 - If `[Susie] PluginPath` is changed, `webp.spi` must be copied to that folder.
+- The context menu is registered under `HKCU\Software\Classes`, so it is per-user and appears under “Show more options” on Windows 11. Putting it in the top-level menu requires an MSIX/IExplorerCommand package, which this patch does not provide.
+- The fifth entry in the file-association list (shown as `....`) is not registered (the original created a meaningless `HKCR\....` key).
+- The IE context menu (MenuExt) still uses the original `HKCU\Software\Microsoft\Internet Explorer\MenuExt` path; Edge does not read it, so it only affects legacy IE.
 
 ### Usage (ready to run)
 
@@ -305,13 +347,13 @@ AvisynthPlugin/       original Avisynth plugins
 docs/                 original documentation
 MangaMeeya 中文版说明.txt   original Chinese edition readme
 original/             unmodified MangaMeeya.exe / arc.dll (reference and rollback)
-patch-source/         patch sources, apply scripts and prebuilt blobs (incl. unicode/, webp/)
+patch-source/         patch sources, apply scripts and prebuilt blobs (incl. unicode/, webp/, shellmenu/)
 SHA256SUMS.txt        SHA-256 of patched and original binaries
 ```
 
 ### Rebuilding the patches
 
-See [patch-source/README.md](patch-source/README.md). Python 3 is required; NASM is required only to reassemble the `.asm` files, and a 32-bit (x86) MSVC or MinGW toolchain is required to rebuild `mmunicode.dll` or `webp.spi`. The text-page crash patch only rewrites machine code in `MangaMeeya.exe` and needs Python only.
+See [patch-source/README.md](patch-source/README.md). Python 3 is required; NASM is required only to reassemble the `.asm` files, and a 32-bit (x86) MSVC or MinGW toolchain is required to rebuild `mmunicode.dll` or `webp.spi`. The text-page crash patch and the context-menu patch only rewrite machine code in `MangaMeeya.exe` and need Python only (the context-menu `.bin` is included; NASM is needed only if you modify the assembly).
 
 ### Privacy
 

@@ -14,12 +14,14 @@
 | `patch_mangameeya_laa.py` | 设置 `MangaMeeya.exe` 的 LAA 标志 |
 | `patch_mangameeya_unicode.py` | 给 `MangaMeeya.exe` 增加 `mmunicode.dll` 导入（特殊字符文件名支持） |
 | `patch_mangameeya_txtcrash.py` | 修复文本页行扫描越界（`sub_453040`，预读 ≥2 页时崩溃） |
+| `patch_mangameeya_shellmenu.py` | Explorer 右键菜单改为按用户写入 `HKCU\Software\Classes` |
+| `shellmenu/shellmenu.asm`、`shellmenu.bin` | 右键菜单补丁汇编源码与机器码 |
 | `unicode/mmunicode.c` | 文件名兼容层源码（32 位 DLL） |
 | `webp/webp.c`、`webp/webp.def` | WebP Susie 图像插件源码（32 位，WIC 解码） |
 
 ## 应用补丁
 
-需要 Python 3；重新汇编 `arc.dll` 补丁时才需要 NASM；重新编译 `mmunicode.dll` 或 `webp.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。
+需要 Python 3；重新汇编 `arc.dll` 补丁或 `shellmenu` 时才需要 NASM；重新编译 `mmunicode.dll` 或 `webp.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。
 
 ```bat
 :: 1) arc.dll（ZIP64）
@@ -31,13 +33,17 @@ python patch_mangameeya_laa.py ..\MangaMeeya.exe ..\MangaMeeya.exe.laa
 :: 3) MangaMeeya.exe（文本页越界修复）
 python patch_mangameeya_txtcrash.py ..\MangaMeeya.exe.laa ..\MangaMeeya.exe.txtfix
 
-:: 4) MangaMeeya.exe（新增 mmunicode.dll 导入）
-python patch_mangameeya_unicode.py ..\MangaMeeya.exe.txtfix ..\MangaMeeya.exe
+:: 4) MangaMeeya.exe（Explorer 右键菜单按用户注册）
+python patch_mangameeya_shellmenu.py ..\MangaMeeya.exe.txtfix ..\MangaMeeya.exe.shellmenu
+
+:: 5) MangaMeeya.exe（新增 mmunicode.dll 导入）
+python patch_mangameeya_unicode.py ..\MangaMeeya.exe.shellmenu ..\MangaMeeya.exe
 ```
 
 `apply_patch.py` 会校验原版字节，只在原始 `arc.dll`（2006-07-19，229376 字节）上工作；已经打过补丁的文件会被拒绝。
 `patch_mangameeya_unicode.py` 通过新增 `.mmuimp` 节来定位，重复执行会被拒绝。
-`patch_mangameeya_txtcrash.py` 校验 `0x531E0` 处的原始指令与 `.text` 尾部空区，重复执行会被拒绝。三个 exe 补丁互不依赖，执行顺序可以互换。
+`patch_mangameeya_txtcrash.py` 校验 `0x531E0` 处的原始指令与 `.text` 尾部空区，重复执行会被拒绝。
+`patch_mangameeya_shellmenu.py` 校验三个 shell 函数的原始字节与 `0xE4700` 空区，重复执行会被拒绝。四个 exe 补丁互不依赖，执行顺序可以互换。
 
 ## 重新编译 mmunicode.dll
 
@@ -73,6 +79,9 @@ nasm -f bin zip64_eocd_comment.asm   -o zip64_eocd_comment.bin
 | MangaMeeya.exe | `e_lfanew + 22` | — | PE FileHeader.Characteristics 置 `0x20` |
 | MangaMeeya.exe | 文件末尾 | 新节 `.mmuimp`（原 `SizeOfImage` 处） | 复制原导入描述符数组 + 新增 `mmunicode.dll!MMUInit`，并把 Import Directory 指向新数组 |
 | MangaMeeya.exe | `0x0531E0` | `0x4531E0` | 文本行扫描入口改为 5 字节 `jmp`，跳入 `0xE4600` 的越界检查代码 |
+| MangaMeeya.exe | `0x058D50` | `0x458D50` | 右键菜单“检查命令”改为 HKCU，跳入 `0xE476D` |
+| MangaMeeya.exe | `0x058E60` | `0x458E60` | 右键菜单“写入命令”改为 HKCU，跳入 `0xE47F8` |
+| MangaMeeya.exe | `0x058FD0` | `0x458FD0` | 右键菜单“删除命令”改为 HKCU，跳入 `0xE488C` |
 
 arc.dll 的补丁代码写入 `.text` 尾部 `0x10029170`–`0x10029479` 的空白区；该范围在原节表 `SizeOfRawData` 内，不需要修改任何 PE 头。
 
@@ -121,3 +130,31 @@ jmp 0x4531F7
 ```
 
 原 `0x4531E0` 处的 `mov ecx,[esp+0x14]` 被替换为 `jmp 0x4E4600`。两个循环回跳目标（`0x4531E0`）及所有外部引用都会经过这段检查；`0x4531E4` 之后没有被其他代码直接跳入，因此替换是安全的。
+
+## Explorer 右键菜单修复（shellmenu/）
+
+Windows 7 以后，普通权限进程不能写 `HKEY_CLASSES_ROOT`；MangaMeeya 的空 `<assembly>` 清单又禁用了 UAC 虚拟化。因此“文件关联设置”里的右键菜单注册在 Win11 上会静默失败（对话框正常关闭，但注册表没有任何变化）。
+
+补丁把三个辅助函数替换为写入当前用户的类注册：
+
+- `sub_458D50`（检查命令） → `check_entry`
+- `sub_458E60`（写入命令） → `set_entry`
+- `sub_458FD0`（删除命令） → `del_entry`
+
+路径规则：
+
+| 列表项 | 注册表位置 |
+|---|---|
+| `Folder` | `HKCU\Software\Classes\Folder\shell\用MangaMeeya打开\command` |
+| `.zip` / `.rar` / `.lzh` / `.cbz` / `.cbr` / `.cbl` / `.jpg` / `.png` / `.gif` / `.bmp` | `HKCU\Software\Classes\SystemFileAssociations\<ext>\shell\用MangaMeeya打开\command` |
+| 第 5 项（显示为 `....`） | 不注册 |
+
+补丁代码位于 `0xE4700`，三个入口各用 5 字节 `jmp` 跳入；参数从原始 cdecl 栈读取，不依赖原函数序言。
+
+重新生成机器码：
+
+```bat
+nasm -f bin shellmenu.asm -o shellmenu.bin
+```
+
+> Win11 的默认右键菜单只显示新式菜单项；旧式 shell 项（包括本补丁注册的）位于 **“显示更多选项”（Shift+F10）**。进入一级菜单需要带 `IExplorerCommand` 的 MSIX/sparse package，本补丁不涉及。
