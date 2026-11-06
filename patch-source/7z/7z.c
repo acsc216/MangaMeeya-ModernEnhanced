@@ -27,7 +27,7 @@
  * GetFile, so position is used as the entry identifier.
  *
  * Build (32-bit):
- *   cl /nologo /LD /MT /O2 /W0 7z.c /link /DEF:7z.def /OUT:7z.spi
+ *   cl /nologo /LD /MT /O2 /W0 7z.c /link /DEF:7z.def user32.lib crypt32.lib /OUT:7z.spi
  *
  * Install with 7za.exe and 7-Zip's License.txt in SusiePlugin\.
  *
@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <wchar.h>
 #include <time.h>
+#include <wincrypt.h>
 
 #define SEVENZ_SIG_OK(p) ((p)[0]==0x37 && (p)[1]==0x7A && (p)[2]==0xBC && \
                           (p)[3]==0xAF && (p)[4]==0x27 && (p)[5]==0x1C)
@@ -78,6 +79,7 @@ typedef struct {
     DWORD  crc;
     long   mtime;
     int    is_dir;
+    int    encrypted;
     int    block;          /* solid block index, -1 if unknown */
     ULONGLONG offset;      /* start offset in the archive's unpacked stream */
     ULONG  id;
@@ -98,7 +100,12 @@ typedef struct WORKER {
 typedef struct ARCHIVE {
     char        key[MAX_PATH * 2];
     WCHAR       archive_w[MAX_PATH * 2];
+    BOOL        is_mem;
     BOOL        solid;
+    BOOL        encrypted;        /* at least one entry or the header is encrypted */
+    BOOL        has_password;
+    BOOL        remember_choice;  /* dialog checkbox */
+    WCHAR       password[512];
     int         block_count;      /* number of solid blocks we will use */
     ENTRY*      entries;
     int         count;
@@ -150,6 +157,9 @@ static ARCHIVE* g_archives;
 static WCHAR g_7za[MAX_PATH];
 static BOOL g_log;
 static BOOL g_memcache;
+static BOOL g_remember_password = TRUE;
+static WCHAR g_env_password[512];
+static BOOL g_has_env_password;
 static CRITICAL_SECTION g_logcs;
 static BOOL g_logcs_init;
 static int  g_threads;
@@ -243,6 +253,337 @@ static void hash_path_cache(const WCHAR* path, char* out /* >=17 */)
         h ^= mt; h *= 1099511628211ULL;
     }
     _snprintf(out, 17, "%016I64x", h);
+}
+
+/* ------------------------------------------------------------------ */
+/* archive passwords                                                   */
+/* ------------------------------------------------------------------ */
+
+static const char g_pw_entropy[] = "MangaMeeya_7z_password";
+
+/* Build " -p\"<password>\"" (quotes inside the password are escaped). */
+static int password_switch(WCHAR* out, int cap, const WCHAR* pwd)
+{
+    int n = 0;
+    if (!pwd || !pwd[0] || cap < 8) return 0;
+    out[n++] = L' '; out[n++] = L'-'; out[n++] = L'p'; out[n++] = L'"';
+    for (; *pwd && n < cap - 3; pwd++) {
+        if (*pwd == L'"') out[n++] = L'\\';
+        out[n++] = *pwd;
+    }
+    out[n++] = L'"';
+    out[n] = 0;
+    return n;
+}
+
+typedef struct {
+    const WCHAR* text;
+    WCHAR* value;
+    int cap;
+    BOOL remember;
+} PWDCTX;
+
+/* Per-user checkbox preference (%APPDATA%\MangaMeeya_7z\remember). */
+static BOOL remember_pref_path(WCHAR* out, int cap)
+{
+    WCHAR appdata[MAX_PATH], dir[MAX_PATH * 2];
+    if (!GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH)) return FALSE;
+    _snwprintf(dir, MAX_PATH * 2, L"%s\\MangaMeeya_7z", appdata);
+    CreateDirectoryW(dir, NULL);
+    _snwprintf(out, cap, L"%s\\remember", dir);
+    return TRUE;
+}
+
+static void save_remember_pref(BOOL on)
+{
+    WCHAR path[MAX_PATH * 2];
+    HANDLE h;
+    DWORD wr = 0;
+    if (!remember_pref_path(path, MAX_PATH * 2)) return;
+    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_HIDDEN, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        WriteFile(h, on ? "1" : "0", 1, &wr, NULL);
+        CloseHandle(h);
+    }
+}
+
+static void load_remember_pref(void)
+{
+    WCHAR path[MAX_PATH * 2];
+    char c = 0;
+    HANDLE h;
+    DWORD got = 0;
+    if (!remember_pref_path(path, MAX_PATH * 2)) return;
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                    OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    if (!ReadFile(h, &c, 1, &got, NULL) || got != 1) c = 0;
+    CloseHandle(h);
+    if (c == '0' || c == '1') g_remember_password = (c == '1');
+}
+
+static BYTE* dlg_align(BYTE* p)
+{
+    return (BYTE*)(((ULONG_PTR)p + 3) & ~(ULONG_PTR)3);
+}
+
+static BYTE* dlg_wstr(BYTE* p, const WCHAR* s)
+{
+    while (*s) { *(WCHAR*)p = *s++; p += 2; }
+    *(WCHAR*)p = 0;
+    return p + 2;
+}
+
+static BYTE* dlg_item(BYTE* p, DWORD style, WORD x, WORD y, WORD cx, WORD cy,
+                      WORD id, WORD cls, const WCHAR* text)
+{
+    DLGITEMTEMPLATE* it;
+    p = dlg_align(p);
+    it = (DLGITEMTEMPLATE*)p;
+    it->style = style;
+    it->dwExtendedStyle = 0;
+    it->x = x; it->y = y; it->cx = cx; it->cy = cy;
+    it->id = id;
+    p += sizeof(DLGITEMTEMPLATE);
+    *(WORD*)p = 0xFFFF; p += 2;
+    *(WORD*)p = cls; p += 2;
+    p = dlg_wstr(p, text);
+    *(WORD*)p = 0; p += 2;
+    return p;
+}
+
+static INT_PTR CALLBACK pwd_dlg_proc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    PWDCTX* ctx = (PWDCTX*)GetWindowLongPtrW(hDlg, DWLP_USER);
+
+    switch (msg) {
+    case WM_INITDIALOG:
+        ctx = (PWDCTX*)lParam;
+        SetWindowLongPtrW(hDlg, DWLP_USER, lParam);
+        if (ctx->text) SetDlgItemTextW(hDlg, 1002, ctx->text);
+        SendDlgItemMessageW(hDlg, 1001, EM_SETLIMITTEXT, (WPARAM)(ctx->cap - 1), 0);
+        if (ctx->value && ctx->value[0]) SetDlgItemTextW(hDlg, 1001, ctx->value);
+        CheckDlgButton(hDlg, 1003, ctx->remember ? BST_CHECKED : BST_UNCHECKED);
+        {
+            HWND owner = GetParent(hDlg);
+            RECT r, pr;
+            if (owner && GetWindowRect(hDlg, &r) && GetWindowRect(owner, &pr)) {
+                int w = r.right - r.left, h = r.bottom - r.top;
+                SetWindowPos(hDlg, NULL,
+                             pr.left + (pr.right - pr.left - w) / 2,
+                             pr.top + (pr.bottom - pr.top - h) / 2,
+                             0, 0, SWP_NOSIZE | SWP_NOZORDER);
+            }
+        }
+        SetFocus(GetDlgItem(hDlg, 1001));
+        return FALSE;
+
+    case WM_COMMAND:
+        if (!ctx) break;
+        switch (LOWORD(wParam)) {
+        case IDOK:
+            GetDlgItemTextW(hDlg, 1001, ctx->value, ctx->cap);
+            ctx->remember = (IsDlgButtonChecked(hDlg, 1003) == BST_CHECKED);
+            EndDialog(hDlg, 1);
+            return TRUE;
+        case IDCANCEL:
+            EndDialog(hDlg, 0);
+            return TRUE;
+        }
+        break;
+
+    case WM_CLOSE:
+        EndDialog(hDlg, 0);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL show_password_dialog(HWND parent, const WCHAR* text, WCHAR* value,
+                                 int cap, BOOL* remember)
+{
+    enum { IDC_EDIT = 1001, IDC_TEXT = 1002, IDC_CHECK = 1003 };
+    BYTE buf[2048];
+    BYTE* p;
+    DLGTEMPLATE* dlg;
+    PWDCTX ctx;
+    INT_PTR r;
+
+    ZeroMemory(buf, sizeof(buf));
+    dlg = (DLGTEMPLATE*)buf;
+    dlg->style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME;
+    dlg->dwExtendedStyle = WS_EX_DLGMODALFRAME;
+    dlg->cdit = 5;
+    dlg->x = 10; dlg->y = 10; dlg->cx = 220; dlg->cy = 92;
+    p = (BYTE*)(dlg + 1);
+    *(WORD*)p = 0; p += 2;      /* menu */
+    *(WORD*)p = 0; p += 2;      /* dialog class */
+    p = dlg_wstr(p, L"7z Password");
+
+    p = dlg_item(p, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                 7, 7, 206, 18, IDC_TEXT, 0x0082, L"");
+    p = dlg_item(p, WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP |
+                    ES_PASSWORD | ES_AUTOHSCROLL,
+                 7, 27, 206, 14, IDC_EDIT, 0x0081, L"");
+    p = dlg_item(p, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                 7, 46, 160, 12, IDC_CHECK, 0x0080,
+                 L"\x8BB0\x4F4F\x5BC6\x7801 / Remember");
+    p = dlg_item(p, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                 92, 68, 50, 14, IDOK, 0x0080, L"OK");
+    p = dlg_item(p, WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                 148, 68, 50, 14, IDCANCEL, 0x0080, L"Cancel");
+
+    ctx.text = text;
+    ctx.value = value;
+    ctx.cap = cap;
+    ctx.remember = remember ? *remember : TRUE;
+    if (!parent) parent = GetActiveWindow();
+    if (!parent) parent = GetForegroundWindow();
+    r = DialogBoxIndirectParamW(g_self, (LPCDLGTEMPLATEW)buf, parent,
+                                pwd_dlg_proc, (LPARAM)&ctx);
+    if (r == 1 && remember) *remember = ctx.remember;
+    return r == 1;
+}
+
+/* Prompt for a password.  MM7Z_PASSWORD, when set, bypasses the dialog
+ * (used for automation/tests). */
+static BOOL ask_password(ARCHIVE* a, BOOL again)
+{
+    WCHAR buf[512];
+    HWND parent;
+    BOOL remember;
+
+    if (g_has_env_password) {
+        wcsncpy(a->password, g_env_password, 511);
+        a->password[511] = 0;
+        a->has_password = TRUE;
+        a->remember_choice = g_remember_password;
+        return TRUE;
+    }
+
+    parent = GetActiveWindow();
+    if (!parent) parent = GetForegroundWindow();
+    if (again)
+        MessageBoxW(parent,
+                    L"\x5BC6\x7801\x9519\x8BEF\xFF0C\x8BF7\x91CD\x8BD5\x3002",
+                    L"7z", MB_OK | MB_ICONWARNING);
+
+    buf[0] = 0;
+    remember = a->remember_choice;
+    if (!show_password_dialog(parent,
+            L"\x538B\x7F29\x5305\x5DF2\x52A0\x5BC6\xFF0C\x8BF7\x8F93\x5165\x5BC6\x7801\xFF1A",
+            buf, 512, &remember))
+        return FALSE;
+    a->remember_choice = remember;
+    g_remember_password = remember; /* applies to later archives too */
+    save_remember_pref(remember);   /* remember the checkbox choice */
+    wcsncpy(a->password, buf, 511);
+    a->password[511] = 0;
+    SecureZeroMemory(buf, sizeof(buf));
+    a->has_password = TRUE;
+    return TRUE;
+}
+
+static BOOL password_file_path(const WCHAR* archive, WCHAR* out, int cap)
+{
+    WCHAR appdata[MAX_PATH], dir[MAX_PATH * 2], hash[24];
+
+    if (!archive || !archive[0]) return FALSE;
+    if (!GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH)) return FALSE;
+    _snwprintf(dir, MAX_PATH * 2, L"%s\\MangaMeeya_7z", appdata);
+    CreateDirectoryW(dir, NULL);
+    _snwprintf(dir, MAX_PATH * 2, L"%s\\MangaMeeya_7z\\passwords", appdata);
+    CreateDirectoryW(dir, NULL);
+    _snwprintf(hash, 24, L"%016I64x", fnv1a_wstr(archive));
+    _snwprintf(out, cap, L"%s\\%s.pw", dir, hash);
+    return TRUE;
+}
+
+static void delete_password(const WCHAR* archive)
+{
+    WCHAR path[MAX_PATH * 2];
+    if (password_file_path(archive, path, MAX_PATH * 2))
+        DeleteFileW(path);
+}
+
+/* Persist with DPAPI (current-user scope), never plaintext. */
+static void save_password(const WCHAR* archive, const WCHAR* pwd, BOOL remember)
+{
+    DATA_BLOB in, out, entropy;
+    WCHAR path[MAX_PATH * 2];
+    HANDLE h;
+    DWORD wr = 0;
+
+    if (!remember) { delete_password(archive); return; }
+    if (!pwd || !pwd[0]) return;
+    if (!password_file_path(archive, path, MAX_PATH * 2)) return;
+
+    in.pbData = (BYTE*)pwd;
+    in.cbData = (DWORD)((wcslen(pwd) + 1) * sizeof(WCHAR));
+    entropy.pbData = (BYTE*)g_pw_entropy;
+    entropy.cbData = (DWORD)(sizeof(g_pw_entropy) - 1);
+    out.pbData = NULL;
+    out.cbData = 0;
+    if (!CryptProtectData(&in, L"7z password", &entropy, NULL, NULL,
+                          CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+        mm_logf("password: CryptProtectData failed err=%lu", GetLastError());
+        return;
+    }
+    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_HIDDEN, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        WriteFile(h, out.pbData, out.cbData, &wr, NULL);
+        CloseHandle(h);
+    }
+    LocalFree(out.pbData);
+}
+
+static BOOL load_password(const WCHAR* archive, WCHAR* out, int cap)
+{
+    DATA_BLOB in, decoded, entropy;
+    WCHAR path[MAX_PATH * 2];
+    HANDLE h;
+    DWORD got = 0, size;
+
+    if (!g_remember_password || !out || cap <= 0) return FALSE;
+    out[0] = 0;
+    if (!password_file_path(archive, path, MAX_PATH * 2)) return FALSE;
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                    OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    size = GetFileSize(h, NULL);
+    if (size == INVALID_FILE_SIZE || size == 0 || size > (1u << 20)) {
+        CloseHandle(h);
+        return FALSE;
+    }
+    in.pbData = (BYTE*)malloc(size);
+    if (!in.pbData) { CloseHandle(h); return FALSE; }
+    if (!ReadFile(h, in.pbData, size, &got, NULL) || got != size) {
+        free(in.pbData);
+        CloseHandle(h);
+        return FALSE;
+    }
+    CloseHandle(h);
+    in.cbData = size;
+    entropy.pbData = (BYTE*)g_pw_entropy;
+    entropy.cbData = (DWORD)(sizeof(g_pw_entropy) - 1);
+    decoded.pbData = NULL;
+    decoded.cbData = 0;
+    if (!CryptUnprotectData(&in, NULL, &entropy, NULL, NULL,
+                            CRYPTPROTECT_UI_FORBIDDEN, &decoded)) {
+        free(in.pbData);
+        return FALSE;
+    }
+    free(in.pbData);
+    if (decoded.cbData >= sizeof(WCHAR) && (decoded.cbData % sizeof(WCHAR)) == 0) {
+        int n = (int)(decoded.cbData / sizeof(WCHAR));
+        if (n > cap - 1) n = cap - 1;
+        memcpy(out, decoded.pbData, n * sizeof(WCHAR));
+        out[n] = 0;
+    }
+    LocalFree(decoded.pbData);
+    return out[0] != 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -692,6 +1033,8 @@ static void parse_listing(const char* text, ARCHIVE* a)
             cur.packsize = _strtoui64(p + 14, NULL, 10);
         } else if (KEYIS("CRC =")) {
             cur.crc = parse_hex_n(p + 6, ll - 6);
+        } else if (KEYIS("Encrypted =")) {
+            if (p[12] == '+') { cur.encrypted = 1; a->encrypted = TRUE; }
         } else if (KEYIS("Block =")) {
             cur.block = atoi(p + 8);
         } else if (KEYIS("Attributes =")) {
@@ -772,20 +1115,39 @@ static void prepare_blocks(ARCHIVE* a)
     }
 }
 
-static BOOL list_archive(ARCHIVE* a)
+/* 0 = ok, 1 = password required/wrong, -1 = other failure */
+static int list_archive(ARCHIVE* a)
 {
-    WCHAR cmd[32768];
+    WCHAR cmd[32768], pwd[600];
     BYTE* out = NULL; DWORD size = 0; DWORD rc;
+    int r;
+
     if (!g_7za[0]) find_7za();
-    _snwprintf(cmd, 32768, L"\"%s\" l -slt -sccUTF-8 -y \"%s\"", g_7za, a->archive_w);
+    pwd[0] = 0;
+    if (a->has_password) password_switch(pwd, 600, a->password);
+    _snwprintf(cmd, 32768, L"\"%s\" l -slt -sccUTF-8 -y%s \"%s\"",
+               g_7za, pwd, a->archive_w);
     log_wide("list: ", cmd);
     rc = run_7za(cmd, &out, &size, TRUE, NULL);
-    if (rc != 0 || !out) { free(out); mm_logf("list rc=%lu", rc); return FALSE; }
+    if (rc != 0 || !out) {
+        r = (out && (strstr((const char*)out, "Enter password") ||
+                     strstr((const char*)out, "Wrong password") ||
+                     strstr((const char*)out, "Cannot open encrypted archive")))
+            ? 1 : -1;
+        mm_logf("list rc=%lu r=%d", rc, r);
+        free(out);
+        return r;
+    }
+    free_entries(a);
+    a->solid = FALSE;
+    a->block_count = 0;
+    a->encrypted = FALSE;
     parse_listing((const char*)out, a);
     free(out);
     prepare_blocks(a);
-    mm_logf("listed %d entries solid=%d blocks=%d", a->count, a->solid, a->block_count);
-    return a->count > 0;
+    mm_logf("listed %d entries solid=%d blocks=%d enc=%d",
+            a->count, a->solid, a->block_count, a->encrypted);
+    return a->count > 0 ? 0 : -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1040,6 +1402,39 @@ static BOOL write_entry_list(ENTRY* e, const WCHAR* path)
     return ok;
 }
 
+/* Test the password against the earliest encrypted entry.  Header
+ * encryption is already proven by a successful listing. */
+static BOOL validate_password(ARCHIVE* a)
+{
+    WCHAR pwd[600], cmd[32768], listpath[MAX_PATH * 2];
+    BYTE* out = NULL;
+    DWORD size = 0, rc;
+    int i, pick = -1;
+
+    if (!a->has_password) return FALSE;
+    for (i = 0; i < a->count; i++) {
+        ENTRY* e = &a->entries[i];
+        if (e->encrypted && (pick < 0 || e->offset < a->entries[pick].offset))
+            pick = i;
+    }
+    if (pick < 0) return TRUE;
+
+    pwd[0] = 0;
+    password_switch(pwd, 600, a->password);
+    if (!make_list_path(a, listpath, MAX_PATH * 2) ||
+        !write_entry_list(&a->entries[pick], listpath))
+        return TRUE;   /* cannot test - do not block opening */
+
+    _snwprintf(cmd, 32768, L"\"%s\" t -y -scsUTF-8%s \"%s\" @\"%s\"",
+               g_7za, pwd, a->archive_w, listpath);
+    rc = run_7za(cmd, &out, &size, TRUE, NULL);
+    DeleteFileW(listpath);
+    free(out);
+    mm_logf("password validation rc=%lu entry=%s", rc,
+            a->entries[pick].name_utf8 ? a->entries[pick].name_utf8 : "?");
+    return rc == 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* extraction workers                                                  */
 /* ------------------------------------------------------------------ */
@@ -1152,6 +1547,7 @@ static unsigned __stdcall stream_reader(void* param)
     ARCHIVE* a = (ARCHIVE*)param;
     WCHAR listpath[MAX_PATH * 2];
     WCHAR cmd[32768];
+    WCHAR pwd[600];
     SECURITY_ATTRIBUTES sa;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -1174,8 +1570,10 @@ static unsigned __stdcall stream_reader(void* param)
         fail = TRUE;
         goto done;
     }
-    _snwprintf(cmd, 32768, L"\"%s\" x -so -y -scsUTF-8 \"%s\" @\"%s\"",
-               g_7za, a->archive_w, listpath);
+    pwd[0] = 0;
+    if (a->has_password) password_switch(pwd, 600, a->password);
+    _snwprintf(cmd, 32768, L"\"%s\" x -so -y%s -scsUTF-8 \"%s\" @\"%s\"",
+               g_7za, pwd, a->archive_w, listpath);
     log_wide("stream: ", cmd);
 
     ZeroMemory(&sa, sizeof(sa));
@@ -1424,6 +1822,7 @@ static unsigned __stdcall worker_proc(void* param)
         int b = w->blocks[i];
         WCHAR listpath[MAX_PATH * 2];
         WCHAR cmd[32768];
+        WCHAR pwd[600];
         RUNCANCEL rc;
         DWORD r;
 
@@ -1437,13 +1836,17 @@ static unsigned __stdcall worker_proc(void* param)
                 w->failed = TRUE;
                 break;
             }
+            pwd[0] = 0;
+            if (a->has_password) password_switch(pwd, 600, a->password);
             _snwprintf(cmd, 32768,
-                       L"\"%s\" x -y -bsp1 -sccUTF-8 -scsUTF-8 -o\"%s\" \"%s\" @\"%s\"",
-                       g_7za, a->cache_w, a->archive_w, listpath);
+                       L"\"%s\" x -y%s -bsp1 -sccUTF-8 -scsUTF-8 -o\"%s\" \"%s\" @\"%s\"",
+                       g_7za, pwd, a->cache_w, a->archive_w, listpath);
         } else {
+            pwd[0] = 0;
+            if (a->has_password) password_switch(pwd, 600, a->password);
             _snwprintf(cmd, 32768,
-                       L"\"%s\" x -y -bsp1 -sccUTF-8 -o\"%s\" \"%s\"",
-                       g_7za, a->cache_w, a->archive_w);
+                       L"\"%s\" x -y%s -bsp1 -sccUTF-8 -o\"%s\" \"%s\"",
+                       g_7za, pwd, a->cache_w, a->archive_w);
         }
 
         InterlockedExchange(&a->block_pct[b], 0);
@@ -1794,6 +2197,7 @@ static BYTE* extract_direct(ARCHIVE* a, ENTRY* e, DWORD* out_size, int* err)
 {
     WCHAR listpath[MAX_PATH * 2];
     WCHAR cmd[32768];
+    WCHAR pwd[600];
     BYTE* out = NULL;
     DWORD size = 0, rc;
 
@@ -1801,8 +2205,10 @@ static BYTE* extract_direct(ARCHIVE* a, ENTRY* e, DWORD* out_size, int* err)
     if (!ensure_cache_dir(a)) { *err = ERR_MEMORY; return NULL; }
     if (!make_list_path(a, listpath, MAX_PATH * 2) || !write_entry_list(e, listpath))
         return NULL;
-    _snwprintf(cmd, 32768, L"\"%s\" x -so -y -scsUTF-8 \"%s\" @\"%s\"",
-               g_7za, a->archive_w, listpath);
+    pwd[0] = 0;
+    if (a->has_password) password_switch(pwd, 600, a->password);
+    _snwprintf(cmd, 32768, L"\"%s\" x -so -y%s -scsUTF-8 \"%s\" @\"%s\"",
+               g_7za, pwd, a->archive_w, listpath);
     rc = run_7za(cmd, &out, &size, TRUE, NULL);
     DeleteFileW(listpath);
     if (rc != 0) {
@@ -1838,6 +2244,60 @@ static ULONGLONG mem_sample_hash(const BYTE* p, long n)
     return h;
 }
 
+static void free_archive(ARCHIVE* a)
+{
+    ARCHIVE** p;
+    int i;
+
+    if (!a) return;
+    for (p = &g_archives; *p; p = &(*p)->next)
+        if (*p == a) { *p = a->next; break; }
+    free_entries(a);
+    if (a->workers) {
+        for (i = 0; i < a->worker_count; i++) {
+            if (a->workers[i].thread) CloseHandle(a->workers[i].thread);
+            free(a->workers[i].blocks);
+        }
+        free(a->workers);
+    }
+    if (a->pins) {
+        for (i = 0; i < a->count; i++)
+            if (a->pins[i]) CloseHandle(a->pins[i]);
+        free(a->pins);
+    }
+    if (a->stream_thread) CloseHandle(a->stream_thread);
+    if (a->stream_wake) CloseHandle(a->stream_wake);
+    if (a->done_event) CloseHandle(a->done_event);
+    free(a->block_bytes);
+    free(a->block_pct);
+    DeleteCriticalSection(&a->cs);
+    free(a);
+}
+
+/* Obtain and check a password after the archive has been listed.  Header
+ * encryption was already proven by the listing; data-only encryption is
+ * tested by extracting the earliest encrypted entry. */
+static BOOL acquire_valid_password(ARCHIVE* a, BOOL header_encrypted)
+{
+    int tries;
+
+    if (a->has_password && !a->encrypted) return TRUE;
+    if (header_encrypted) return TRUE;
+    if (!a->encrypted) return TRUE;
+
+    for (tries = 0; tries < 3; tries++) {
+        if (!a->has_password) {
+            if (g_has_env_password) return FALSE;
+            if (!ask_password(a, tries > 0)) return FALSE;
+        }
+        if (validate_password(a)) return TRUE;
+        a->has_password = FALSE;
+        a->password[0] = 0;
+        if (g_has_env_password) return FALSE;
+    }
+    return FALSE;
+}
+
 static ARCHIVE* get_archive(LPCSTR src, long len, UINT flag, BOOL mem_size_valid, BOOL* err)
 {
     char key[MAX_PATH * 2];
@@ -1866,6 +2326,8 @@ static ARCHIVE* get_archive(LPCSTR src, long len, UINT flag, BOOL mem_size_valid
     lstrcpynA(a->key, key, sizeof(a->key));
     InitializeCriticalSection(&a->cs);
     a->done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    a->is_mem = mem;
+    a->remember_choice = g_remember_password;
 
     if (mem) {
         WCHAR temp[MAX_PATH], tpath[MAX_PATH];
@@ -1897,11 +2359,47 @@ static ARCHIVE* get_archive(LPCSTR src, long len, UINT flag, BOOL mem_size_valid
         _snwprintf(a->cache_w, MAX_PATH * 2, L"%sMangaMeeya_7z\\%hs", temp, a->cache_hash);
     }
 
+    if (g_has_env_password) {
+        wcsncpy(a->password, g_env_password, 511);
+        a->password[511] = 0;
+        a->has_password = TRUE;
+    } else if (!a->is_mem && g_remember_password) {
+        if (load_password(a->archive_w, a->password, 512))
+            a->has_password = TRUE;
+    }
+
     a->next = g_archives;
     g_archives = a;
-    if (!list_archive(a)) {
-        *err = TRUE;
-    } else {
+
+    {
+        int tries, r = -1;
+        BOOL header_encrypted = FALSE;
+
+        for (tries = 0; tries < 3; tries++) {
+            r = list_archive(a);
+            if (r == 0) break;
+            if (r != 1) break;
+            header_encrypted = TRUE;
+            if (g_has_env_password) { r = -1; break; }
+            {
+                BOOL had = a->has_password;
+                a->has_password = FALSE;
+                a->password[0] = 0;
+                if (!ask_password(a, had || tries > 0)) { r = -1; break; }
+            }
+        }
+        if (r != 0) {
+            *err = TRUE;
+            free_archive(a);
+            return NULL;
+        }
+        if (!acquire_valid_password(a, header_encrypted)) {
+            *err = TRUE;
+            free_archive(a);
+            return NULL;
+        }
+        if (!a->is_mem && (a->encrypted || header_encrypted))
+            save_password(a->archive_w, a->password, a->remember_choice);
         if (a->memcache) {
             int n = (int)wcslen(a->cache_w);
             if (n + 5 < MAX_PATH * 2) wcscat(a->cache_w, L"_mem");
@@ -1927,7 +2425,7 @@ __declspec(dllexport) int WINAPI GetPluginInfo(int infono, LPSTR buf, int buflen
 {
     switch (infono) {
     case 0: return copy_info("00AM", buf, buflen);
-    case 1: return copy_info("7z Archive Plug-in v1.4 (on-demand / parallel / cache cap)", buf, buflen);
+    case 1: return copy_info("7z Archive Plug-in v1.6 (on-demand / parallel / password)", buf, buflen);
     case 2: return copy_info("*.7Z", buf, buflen);
     case 3: return copy_info("7z Archive", buf, buflen);
     default: return 0;
@@ -2143,8 +2641,12 @@ BOOL WINAPI DllMain(HMODULE hm, DWORD reason, LPVOID p)
                 n = (int)GetPrivateProfileIntW(L"7z", L"Log", (UINT)-1, ini);
                 if (n > 0)
                     g_log = TRUE;
+                n = (int)GetPrivateProfileIntW(L"7z", L"RememberPassword", (UINT)-1, ini);
+                if (n >= 0)
+                    g_remember_password = (n != 0);
             }
         }
+        load_remember_pref();   /* last dialog choice overrides the ini */
 
         if (GetEnvironmentVariableA("MM7Z_LOG", v, sizeof(v)) > 0 && v[0] == '1')
             g_log = TRUE;
@@ -2165,6 +2667,12 @@ BOOL WINAPI DllMain(HMODULE hm, DWORD reason, LPVOID p)
             int n = atoi(v);
             if (n >= 0 && n <= 1024 * 1024)   /* 0 = no cleanup */
                 g_cache_max = (ULONGLONG)n * 1024ULL * 1024ULL;
+        }
+        if (GetEnvironmentVariableA("MM7Z_REMEMBER_PASSWORD", v, sizeof(v)) > 0 && v[0] == '0')
+            g_remember_password = FALSE;
+        if (GetEnvironmentVariableW(L"MM7Z_PASSWORD", g_env_password, 512) > 0) {
+            g_env_password[511] = 0;
+            g_has_env_password = TRUE;
         }
         g_job = CreateJobObjectW(NULL, NULL);
         if (g_job) {

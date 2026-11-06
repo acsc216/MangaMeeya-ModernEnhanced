@@ -113,8 +113,10 @@ cl /nologo /LD /MT /O2 /W0 webp.c /link /DEF:webp.def windowscodecs.lib ole32.li
 `7z/` 是一个 32 位 Susie **归档插件**（`00AM`），让 MangaMeeya 能打开 `.7z`。它自身不链接 7-Zip 的代码，而是在运行时调用与本插件放在同一目录（或 `PATH` 中）的 `7za.exe`（x86 版）。
 
 ```bat
-cl /nologo /LD /MT /O2 /W0 7z.c /link /DEF:7z.def /OUT:7z.spi
+cl /nologo /LD /MT /O2 /W0 7z.c /link /DEF:7z.def user32.lib crypt32.lib /OUT:7z.spi
 ```
+
+`user32.lib` 用于密码输入框，`crypt32.lib` 用于 DPAPI 加密保存密码。
 
 把 `7z.spi`、`7za.exe` 和 `7z-License.txt` 一起复制到 `SusiePlugin\`（即 `[Susie] PluginPath`）即可。`7za.exe` 与 `7z-License.txt` 来自 7-Zip 官方发行包，遵循 7-Zip 的许可证。
 
@@ -132,6 +134,14 @@ cl /nologo /LD /MT /O2 /W0 7z.c /link /DEF:7z.def /OUT:7z.spi
 
 非固实档案不建立缓存，直接对单个条目执行 `7za x -so`。
 
+### 加密档案
+
+- 支持仅数据加密的 7z（列表可见，条目显示 `Encrypted = +`），也支持 `-mhe=on` 的加密文件名归档（列表本身需要密码）。
+- 打开加密档案时，插件在 MangaMeeya 内弹出密码输入框；密码错误最多重试 3 次，取消则放弃打开。
+- 密码会先用于 `7za l`，数据加密的包还会用 `7za t` 测试最早的一个加密条目，确认无误后才开始解压。
+- 记住密码：密码框内有「记住密码 / Remember」复选框，默认勾选（由 `7z.ini` 的 `RememberPassword` 决定初始状态）。用户勾选/取消后，插件会把选择写入 `%APPDATA%\MangaMeeya_7z\remember`，作为下次弹窗的默认值；取消勾选不会保存密码，并会删除该档案已保存的密码。勾选时密码通过 Windows **DPAPI**（当前用户范围）加密后存到 `%APPDATA%\MangaMeeya_7z\passwords\<hash>.pw`，下次打开同一路径的档案自动使用。删除该目录即可“忘记”全部密码；换用户/换机器无法解密。
+- 密码在运行时通过 `-p"..."` 传给 `7za.exe`（与 7-Zip 命令行一致），本机同用户进程理论上可在命令行中看到；如需避免这一点，可设置 `RememberPassword=0` 并仅在需要时输入，但无法完全规避。
+
 ### 配置文件
 
 `SusiePlugin\7z.ini`（与 `7z.spi` 同目录）的 `[7z]` 段：
@@ -143,6 +153,7 @@ cl /nologo /LD /MT /O2 /W0 7z.c /link /DEF:7z.def /OUT:7z.spi
 | `Threads` | `0` | 多块并行解码进程数；0 = 自动 `min(块数, CPU 数, 8)` |
 | `MemCache` | `0` | 1 = 会话级内存缓存（Windows 缓存管理器，退出即删） |
 | `Log` | `0` | 1 = 写 `%TEMP%\7zspi.log` |
+| `RememberPassword` | `1` | 密码框「记住密码」复选框的初始状态；用户的实际选择另存于 `%APPDATA%\MangaMeeya_7z\remember` 并优先 |
 
 没有 `7z.ini` 时读取 `MangaMeeya.exe` 旁边 `MangaMeeya.ini` 的 `[7z]` 段。环境变量（见下）优先于配置文件。
 
@@ -155,6 +166,8 @@ cl /nologo /LD /MT /O2 /W0 7z.c /link /DEF:7z.def /OUT:7z.spi
 | `MM7Z_THREADS=n` | 覆盖多块并行解码进程数（1–16；默认 `min(块数, CPU 数, 8)`） |
 | `MM7Z_PREFETCH=n` | 单块按需解码的预读窗口，单位 MiB（默认 64；0 = 只解到当前页） |
 | `MM7Z_MEMCACHE=1` | 单块按需解码使用**会话级内存缓存**：缓存文件以 `FILE_ATTRIBUTE_TEMPORARY \| FILE_FLAG_DELETE_ON_CLOSE` 创建并保持句柄，数据由 Windows 缓存管理器留在内存（内存压力下才落盘），不进本进程地址空间；退出即删除，不跨会话复用 |
+| `MM7Z_PASSWORD=...` | 预设密码，不弹输入框（用于自动化/测试；密码错误时直接失败）。设置后仍会按 `RememberPassword` 决定是否保存 |
+| `MM7Z_REMEMBER_PASSWORD=0` | 关闭密码记忆 |
 
 ### 测试程序
 
@@ -167,9 +180,10 @@ test_7zspi.exe <7z.spi 的路径> <测试包.7z> [--mem] [--cancel | --cancel-on
 
 ### 已知限制
 
-- 需要密码的 7z（含加密文件名）不支持：`7za.exe` 在无控制台输入时会失败并返回错误。
+- 每个加密档案假设只有一个密码（7z 的常见情况）；不同条目使用不同密码的归档不支持。
+- 密码存储在 `%APPDATA%\MangaMeeya_7z\passwords`，按**档案完整路径**作为键：移动或重命名档案后需要重新输入。
 - Susie `fileInfo` 的 `filesize`/`compsize` 是 32 位，单个条目 ≥ 4GB 时数值会截断（MangaMeeya 本身也无法分配这么大的页面）。
-- 缓存目录不会自动清理；删除 `%TEMP%\MangaMeeya_7z` 即可释放空间，下次打开会重新解压。
+- 缓存默认上限 5 GB（`CacheMaxMB`），超过后下次打开档案时按 LRU 清理旧目录；可把该值设为 0 关闭自动清理。
 - 单块固实档案的解码速度受单线程 LZMA2 限制，这是格式本身决定的。
 
 ## 文本页越界修复（patch_mangameeya_txtcrash.py）

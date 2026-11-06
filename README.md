@@ -111,7 +111,8 @@ MangaMeeya 的 `arc.dll` 不支持 7z。新增 32 位 Susie 归档插件 `SusieP
 - **缓存**：位于 `%TEMP%\MangaMeeya_7z\<hash>\`，`<hash>` 由档案完整路径、大小、修改时间决定；已存在的完整文件在重新解码时直接复用（跳过写入）；
 - **会话级内存缓存（可选）**：`MM7Z_MEMCACHE=1` 时，单块按需解码写出的页面使用 `FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE` 并保持一个“钉住”句柄。Windows 缓存管理器会把数据留在内存中（仅在内存压力下回写磁盘），**不占用 32 位进程的地址空间**；MangaMeeya 退出时文件自动删除，不在 `%TEMP%` 留下残留。代价是不跨会话复用（下次打开重新解码）；内存不足时仍会落盘。默认关闭，使用持久磁盘缓存；
 - **压缩端建议**：官方推荐的随机访问做法是使用多个较小的固实块，例如 `7z a -ms=64m`（漫画可用 `-ms=16m`）；实测 `-ms=64m` 把 200MB 数据分成 4 块，插件用 4 个进程并行解码。若追求每页独立读取，应使用 `-ms=off` 或 ZIP（MangaMeeya 原生支持）；
-- **缓存上限与配置**：配置文件为 `SusiePlugin\7z.ini`（`[7z]` 段），`CacheMaxMB` 默认 **5120（5 GB）**，设为 0 可关闭自动清理。每次打开档案时统计 `%TEMP%\MangaMeeya_7z` 的总大小，超过上限就按“最久未使用”删除旧缓存目录；当前打开的档案和最近 10 分钟用过的缓存不会被删。同文件还支持 `PrefetchMB`、`Threads`、`MemCache`、`Log`；环境变量 `MM7Z_*` 优先级更高。若没有 `7z.ini`，会读取 `MangaMeeya.ini` 的 `[7z]` 段；
+- **缓存上限与配置**：配置文件为 `SusiePlugin\7z.ini`（`[7z]` 段），`CacheMaxMB` 默认 **5120（5 GB）**，设为 0 可关闭自动清理。每次打开档案时统计 `%TEMP%\MangaMeeya_7z` 的总大小，超过上限就按“最久未使用”删除旧缓存目录；当前打开的档案和最近 10 分钟用过的缓存不会被删。同文件还支持 `PrefetchMB`、`Threads`、`MemCache`、`Log`、`RememberPassword`；环境变量 `MM7Z_*` 优先级更高。若没有 `7z.ini`，会读取 `MangaMeeya.ini` 的 `[7z]` 段；
+- **加密 7z**：支持仅数据加密的包和加密文件名（`-mhe=on`）的包。打开时在 MangaMeeya 内弹出密码输入框，密码错误最多重试 3 次。密码框内有 **“记住密码 / Remember”复选框，默认勾选**；取消勾选则不保存该密码（并删除该档案已保存的密码），勾选则保存。你的勾选状态会被记住，作为下次弹窗的默认值（`%APPDATA%\MangaMeeya_7z\remember`）。密码通过 Windows **DPAPI**（当前用户）加密后保存在 `%APPDATA%\MangaMeeya_7z\passwords`，下次打开同一路径的档案自动使用；`7z.ini` 的 `RememberPassword` 只是复选框的初始默认值；
 - **UTF-8 文件名**：条目清单通过 `-scsUTF-8` 列表文件传给 7za，含日文/中文目录和文件名也能正确匹配；同时修复了用 `lstrcmpiA` 比较 UTF-8 名称时在 CP936 下把 `第1巻` 与 `第2巻` 误判为同一文件的问题；
 - **取消**：Susie 00AM 的 `GetFile` 进度回调返回**非 0** 时立即终止所有解码子进程并返回错误码 1（注意与图像插件 `GetPicture` 的“返回 0 取消”相反）；下次读取会自动重新开始解压；
 - 诊断：设置 `MM7Z_LOG=1` 可把启动、列表、解码暂停/完成和错误码写入 `%TEMP%\7zspi.log`；`MM7Z_PREFETCH=n` 设置单块固实包的预读窗口（MiB，默认 64，0 表示只解到当前页）。
@@ -153,6 +154,10 @@ MangaMeeya 的 `arc.dll` 不支持 7z。新增 32 位 Susie 归档插件 `SusieP
 | **1.82GB 单块固实包（解压后 2.4GB，BallonsTranslator 导出）** | 打开并显示第 64 页约 1.7s，解码在约 356MB 处暂停（不再后台解完整包）；跳到最后一页约 19s 后完成并写入 `.done`，CRC 校验通过；之后打开直接读缓存 |
 | 单块固实包只读前 8 条（冷缓存） | 1.75s，缓存 285MB，日志显示 `paused`；未解码部分保持未解 |
 | 单块固实包跳到末页（从部分缓存） | 19.2s 完成，2.4GB，`.done` 写入，末页 CRC 正确 |
+| 7z 数据加密（密码 `SECRET`） | 列出/解码正常；密码写入 DPAPI 存储，新进程重开自动使用 |
+| 7z 加密文件名（`-mhe=on`，MangaMeeya GUI） | 弹出密码框；输入后显示 1/2 页；重开不再提示 |
+| 密码含空格（`my pass`） | 正常 |
+| 错误密码 | 最多重试 3 次；取消或超限后放弃打开，不会保存错误密码 |
 | 全空文件包 / 非固实包 / 多块固实包 | 回归通过 |
 | 文件关联设置勾选 `Folder` / `.zip` 并确定 | `HKCU\Software\Classes\...` 生成 command，Shell 能枚举到“用MangaMeeya打开” |
 | 勾选 `.jpg` / `.bmp` 等图片类型 | `SystemFileAssociations\<ext>` 下生成，对应文件右键菜单可见 |
@@ -329,7 +334,8 @@ MangaMeeya's `arc.dll` does not support 7z. A 32-bit Susie archive plug-in, `Sus
 - **Cache**: `%TEMP%\MangaMeeya_7z\<hash>\`, where the hash covers the archive path, size and modification time. Complete files are reused on re-decode (their writes are skipped).
 - **Optional session memory cache**: with `MM7Z_MEMCACHE=1`, pages decoded by the single-block stream are created with `FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE` and kept open by a pin handle. The Windows cache manager keeps them in RAM (writing back only under memory pressure), **outside the 32-bit process's address space**, and they are deleted when MangaMeeya exits, leaving nothing in `%TEMP%`. The trade-off is no reuse across sessions (the next open decodes again); under memory pressure data still spills to disk. Off by default (persistent disk cache).
 - **Archive-side advice**: the official way to get fast random access is smaller solid blocks, e.g. `7z a -ms=64m` (use `-ms=16m` for comics). `-ms=64m` split a 200MB test set into 4 blocks, which the plug-in decoded with 4 parallel processes. For fully independent pages use `-ms=off` or a ZIP (natively supported by MangaMeeya).
-- **Cache cap and configuration**: `SusiePlugin\7z.ini` (`[7z]` section); `CacheMaxMB` defaults to **5120 (5 GB)** and 0 disables cleanup. When an archive is opened the plug-in adds up the size of `%TEMP%\MangaMeeya_7z` and, if it is over the cap, deletes the least recently used cache directories; the archive currently open and anything used in the last 10 minutes are kept. The same file also supports `PrefetchMB`, `Threads`, `MemCache` and `Log`; `MM7Z_*` environment variables take precedence. If `7z.ini` is absent, the `[7z]` section of `MangaMeeya.ini` is used.
+- **Cache cap and configuration**: `SusiePlugin\7z.ini` (`[7z]` section); `CacheMaxMB` defaults to **5120 (5 GB)** and 0 disables cleanup. When an archive is opened the plug-in adds up the size of `%TEMP%\MangaMeeya_7z` and, if it is over the cap, deletes the least recently used cache directories; the archive currently open and anything used in the last 10 minutes are kept. The same file also supports `PrefetchMB`, `Threads`, `MemCache`, `Log` and `RememberPassword`; `MM7Z_*` environment variables take precedence. If `7z.ini` is absent, the `[7z]` section of `MangaMeeya.ini` is used.
+- **Encrypted 7z**: data-only encryption and encrypted headers (`-mhe=on`) are supported. A password dialog appears inside MangaMeeya; up to three attempts are allowed. It contains a **“记住密码 / Remember” checkbox, checked by default**; unchecking does not save the password (and removes any saved one for that archive), checking saves it. The checkbox choice is remembered as the default for the next dialog (`%APPDATA%\MangaMeeya_7z\remember`). Passwords are encrypted with Windows **DPAPI** (current user) under `%APPDATA%\MangaMeeya_7z\passwords` and reused automatically for the same archive path; `RememberPassword` in `7z.ini` only sets the checkbox's initial default.
 - **UTF-8 names**: per-block file lists are passed through `-scsUTF-8` list files, so Japanese/Chinese directory and file names match correctly. This also fixes UTF-8 entry names being compared with `lstrcmpiA`, which under CP936 made `第1巻` and `第2巻` look identical.
 - **Cancellation**: a **non-zero** return from the 00AM `GetFile` progress callback terminates all decoder processes and returns error code 1 (note this is the opposite of the image-filter `GetPicture` convention, where zero cancels); the next read starts a fresh extraction.
 - Diagnostics: `MM7Z_LOG=1` writes startup, listing, decode pause/completion and error codes to `%TEMP%\7zspi.log`; `MM7Z_PREFETCH=n` sets the single-block read-ahead window in MiB (default 64; 0 means decode only up to the current page).
@@ -371,6 +377,10 @@ MangaMeeya's `arc.dll` does not support 7z. A 32-bit Susie archive plug-in, `Sus
 | **1.82GB single-block solid archive (2.4GB unpacked, BallonsTranslator export)** | Opens and displays page 64 in about 1.7s; decoding pauses at about 356MB instead of extracting the whole archive; a jump to the last page completes in about 19s and writes `.done` with all CRCs verified; later opens read the cache directly |
 | First 8 entries of the single-block archive (cold cache) | 1.75s, 285MB cached, log shows `paused`; the rest stays undecoded |
 | Jump to the last page from a partial cache | Completes in 19.2s, 2.4GB, `.done` written, last-page CRC correct |
+| Data-encrypted 7z (password `SECRET`) | Lists/decodes normally; password saved via DPAPI and reused by a new process |
+| Header-encrypted 7z (`-mhe=on`, MangaMeeya GUI) | Password dialog appears; after entry page 1/2 renders; reopening does not prompt |
+| Password containing a space (`my pass`) | Works |
+| Wrong password | Up to three attempts; cancelling or exhausting them aborts opening and does not save the wrong password |
 | All-empty archive / non-solid / multi-block archives | Regression pass |
 | Register `Folder` / `.zip` in File association settings | `HKCU\Software\Classes\...` command created; the shell enumerates “用MangaMeeya打开” |
 | Register `.jpg` / `.bmp` and other image types | Created under `SystemFileAssociations\<ext>`; visible in the file context menu |
