@@ -18,6 +18,8 @@
 | `shellmenu/shellmenu.asm`、`shellmenu.bin` | 右键菜单补丁汇编源码与机器码 |
 | `unicode/mmunicode.c` | 文件名兼容层源码（32 位 DLL） |
 | `webp/webp.c`、`webp/webp.def` | WebP Susie 图像插件源码（32 位，WIC 解码） |
+| `7z/7z.c`、`7z/7z.def` | 7z Susie 归档插件源码（32 位，调用 7za.exe；固实块并行解压） |
+| `7z/test/test_7zspi.c` | 7z 插件控制台测试程序（校验列表、CRC、内存输入、取消） |
 
 ## 应用补丁
 
@@ -105,6 +107,53 @@ cl /nologo /LD /MT /O2 /W0 webp.c /link /DEF:webp.def windowscodecs.lib ole32.li
 ```
 
 把 `webp.spi` 复制到 `SusiePlugin\`（即 `[Susie] PluginPath`）即可。插件注册 `*.WEBP`，`GetPicture` 返回 24bpp 自下而上的 DIB；透明通道在插件内合成到白色背景（MangaMeeya 的 Susie 图像路径不做逐像素 alpha 合成），动画 WebP 只显示第一帧。
+
+## 重新编译 7z.spi
+
+`7z/` 是一个 32 位 Susie **归档插件**（`00AM`），让 MangaMeeya 能打开 `.7z`。它自身不链接 7-Zip 的代码，而是在运行时调用与本插件放在同一目录（或 `PATH` 中）的 `7za.exe`（x86 版）。
+
+```bat
+cl /nologo /LD /MT /O2 /W0 7z.c /link /DEF:7z.def /OUT:7z.spi
+```
+
+把 `7z.spi`、`7za.exe` 和 `7z-License.txt` 一起复制到 `SusiePlugin\`（即 `[Susie] PluginPath`）即可。`7za.exe` 与 `7z-License.txt` 来自 7-Zip 官方发行包，遵循 7-Zip 的许可证。
+
+### 固实档案的并行解压
+
+7z 的固实（solid）档案内部由若干**独立的固实块（block / folder）**组成。`7za l -slt` 会在头部输出 `Blocks = N`，并为每个文件输出 `Block = k`。LZMA2 在**单个块内部**只能顺序解码，但不同块之间互不依赖，因此插件：
+
+1. 列出条目时记录每个文件的块号；
+2. 首次读取时按块分组，为每块启动一个 `7za.exe x` 进程（最多 `min(块数, CPU 数, 8)` 个，可用环境变量调整），多个块真正并行解码；
+3. 每个块的文件清单通过 UTF-8 列表文件（`-scsUTF-8`）传给 7za，避免命令行长度和引号问题；带日文/中文目录名的条目也按原路径匹配；
+4. 解压到 `%TEMP%\MangaMeeya_7z\<hash>\`，`<hash>` 由档案完整路径 + 大小 + 修改时间决定；全部完成后写入 `.done` 标记，下次打开直接复用；
+5. `GetFile` **按页等待**：目标文件一旦写完（大小匹配并校验 CRC32）就立即返回，不必等整包解压完。MangaMeeya 翻页时后台继续解压其余块。
+
+单块固实档案无法在 LZMA2 层面并行（解码是严格串行的），此时仍是一个解码进程，但同样具备“第一页先到”的流式效果；多块档案（用 `-mmt` 多线程压缩的大包很常见）才能获得多核加速。
+
+非固实档案不建立缓存，直接对单个条目执行 `7za x -so`。
+
+### 环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `MM7Z_LOG=1` | 把日志追加到 `%TEMP%\7zspi.log`（启动、列表、块进度、错误码） |
+| `MM7Z_THREADS=n` | 覆盖并行解码进程数（1–16；默认 `min(块数, CPU 数, 8)`） |
+
+### 测试程序
+
+```bat
+cl /nologo /MT /O2 /W0 test_7zspi.c /Fe:test_7zspi.exe
+test_7zspi.exe <7z.spi 的路径> <测试包.7z> [--mem] [--cancel | --cancel-only] [--quiet]
+```
+
+它通过 `LoadLibrary` 调用插件的 Susie 导出函数，逐条读取并校验大小/CRC，覆盖文件输入、内存映像输入、目录输出、取消与取消后重启。注意：`7z.spi` 会优先在自身目录寻找 `7za.exe`，测试时请把两者放在同一目录。
+
+### 已知限制
+
+- 需要密码的 7z（含加密文件名）不支持：`7za.exe` 在无控制台输入时会失败并返回错误。
+- Susie `fileInfo` 的 `filesize`/`compsize` 是 32 位，单个条目 ≥ 4GB 时数值会截断（MangaMeeya 本身也无法分配这么大的页面）。
+- 缓存目录不会自动清理；删除 `%TEMP%\MangaMeeya_7z` 即可释放空间，下次打开会重新解压。
+- 单块固实档案的解码速度受单线程 LZMA2 限制，这是格式本身决定的。
 
 ## 文本页越界修复（patch_mangameeya_txtcrash.py）
 

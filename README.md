@@ -22,6 +22,7 @@ MangaMeeya 7.4 是 2006 年的 32 位程序。它在以下几类场景会失败�
 - 文件名含当前系统代码页无法表示的字符（例如简体中文 Windows 下的日文「・」U+30FB）：字符被转换成 `?`，程序提示“无效路径”，文件无法打开；
 - 以 `.txt` 文本作为页面的压缩包（例如带 BepInEx 本地化文本的模组包）在“预读 2 页以上”（`PrepageForwardNum=2`）时直接崩溃退出（0xC0000005）；
 - 无法读取和显示 **WebP 图片**，含 WebP 条目的压缩包也会因没有解码器而无法正常显示；
+- **无法打开 `.7z` 档案**（arc.dll 只支持 ZIP/RAR/LZH 等格式），固实档案更是没有任何可用的预解压路径；
 - 在 Windows 11 上，“文件关联设置”里的 **Explorer 右键菜单注册会静默失败**（普通权限进程无法写 `HKEY_CLASSES_ROOT`，程序清单又禁用了 UAC 虚拟化）。
 
 本仓库修复了这些问题，并提供**即开即用**的完整程序。
@@ -100,6 +101,20 @@ Windows 7 以后，普通权限进程不能写 `HKEY_CLASSES_ROOT`；MangaMeeya 
 
 > **Win11 菜单位置**：Windows 11 的默认右键菜单只显示新式菜单项；所有旧式 shell 项（包括本补丁注册的）都在 **“显示更多选项”**（Shift+F10）里。要把条目放进一级菜单，需要带 `IExplorerCommand` 的 MSIX/sparse package，本补丁不涉及。
 
+#### 7. SusiePlugin/7z.spi + 7za.exe — 7z 支持与固实块并行解压
+
+MangaMeeya 的 `arc.dll` 不支持 7z。新增 32 位 Susie 归档插件 `SusiePlugin/7z.spi`，它调用同目录的 `7za.exe`（7-Zip 26.00 x86，随包附带）完成解码：
+
+- **非固实档案**：直接 `7za x -so` 把单页流式取到内存，不建缓存；
+- **固实档案**：`7za l -slt` 的头部给出 `Blocks = N`，每个条目带有 `Block = k`。LZMA2 在单个固实块内部只能顺序解码，但**块与块相互独立**，因此插件按块分组，为每块启动一个 `7za.exe` 进程并行解压（默认 `min(块数, CPU 数, 8)`，可用 `MM7Z_THREADS` 调整）。实测 156MB / 3 块随机数据：单进程约 2.7s，3 进程并行 CPU 总时间约 3.8s、墙钟约 1.2s；
+- **按页流式返回**：解压到 `%TEMP%\MangaMeeya_7z\<hash>\`（`<hash>` 由档案完整路径、大小、修改时间决定）。`GetFile` 只等待目标文件写完（大小匹配并用 CRC32 校验），第一页无需等整包解压完；MangaMeeya 翻页时后台继续解压其余块。实测 176MB / 800 页真实 JPEG 漫画包（3 块）在 MangaMeeya 中打开：第一页约 0.1s 返回，三个块约 0.7s 并行解压完毕，顺序翻到第 800 页无错误；缓存就绪后整本顺序读取约 1s；
+- **UTF-8 文件名**：条目清单通过 `-scsUTF-8` 列表文件传给 7za，含日文/中文目录和文件名也能正确匹配；同时修复了用 `lstrcmpiA` 比较 UTF-8 名称时在 CP936 下把 `第1巻` 与 `第2巻` 误判为同一文件的问题；
+- **取消**：Susie 00AM 的 `GetFile` 进度回调返回**非 0** 时立即终止所有解码子进程并返回错误码 1（注意与图像插件 `GetPicture` 的“返回 0 取消”相反）；下次读取会自动重新开始解压；
+- 诊断：设置 `MM7Z_LOG=1` 可把启动、列表、块进度和错误码写入 `%TEMP%\7zspi.log`。
+
+> 依赖：`7z.spi`、`7za.exe`、`7z-License.txt` 必须一起放在 `SusiePlugin`。`7za.exe` 来自 7-Zip 官方发行包，遵循 7-Zip 许可证（见 `7z-License.txt`）。
+> 为什么不能“整包多线程”：单个 LZMA2 流必须从头顺序解码，任何解码器都无法把它拆到多个核心；能并行的是**不同的固实块**。因此单块固实包仍然只有一个解码线程（但具备第一页先到的流式效果），多块固实包才能获得多核加速。
+
 ### 已验证场景
 
 | 场景 | 结果 |
@@ -124,6 +139,13 @@ Windows 7 以后，普通权限进程不能写 `HKEY_CLASSES_ROOT`；MangaMeeya 
 | 仅含 WebP 的 ZIP / JPEG+WebP 混合 ZIP | 页数正确，WebP 页正常显示 |
 | 文件名/目录名含 `・` 的 WebP 文件与含 WebP 的 ZIP | 正常打开并显示 |
 | 含透明通道的 WebP | 正常显示（透明区域合成到白色背景） |
+| 7z 单块固实包（120 条目 / 131MB） | 全部列出并解码，逐条 CRC 校验通过 |
+| 7z 多块固实包（`Blocks = 3`，120 条目） | 3 个解码进程并行；全部条目 CRC 校验通过 |
+| 7z 多块固实包，目录/文件名含日文（`第1巻/ページ・*.jpg`） | 列表、按块解压与 CRC 均正常 |
+| 7z 非固实包（每文件独立块） | 逐条 `x -so` 解压正常 |
+| 7z 内存映像输入（`GetArchiveInfo` / `GetFile` 的 `flag=1`） | 正常 |
+| 7z 解压过程中取消 | 立即终止解码进程并返回 1；再次读取时重新解压 |
+| **176MB / 800 页 / 3 块的真实 JPEG 漫画包（MangaMeeya GUI）** | 打开后 1/800 正常显示；翻页到 800/800 全程正常，无取消/错误；三个固实块并行解压 |
 | 文件关联设置勾选 `Folder` / `.zip` 并确定 | `HKCU\Software\Classes\...` 生成 command，Shell 能枚举到“用MangaMeeya打开” |
 | 勾选 `.jpg` / `.bmp` 等图片类型 | `SystemFileAssociations\<ext>` 下生成，对应文件右键菜单可见 |
 | 取消注册 | 对应 HKCU 键被删除 |
@@ -141,6 +163,10 @@ Windows 7 以后，普通权限进程不能写 `HKEY_CLASSES_ROOT`；MangaMeeya 
 - WebP 解码依赖系统的 WIC WebP 编解码器。Windows 11 通常自带；Windows 10 如未安装 “WebP Image Extensions”，`webp.spi` 将无法解码并可能显示为空白。
 - 透明 WebP 会合成到白底（不会穿透到 MangaMeeya 的背景色）；动画 WebP 只显示第一帧。
 - 如果用户修改了 `[Susie] PluginPath`，需要把 `webp.spi` 复制到对应目录。
+- 7z 插件依赖同目录的 `7za.exe`（随包附带）；删除或移动它会导致 7z 无法打开。加密的 7z（含加密文件名）不支持。
+- 7z 固实包首次打开会把整包解压到 `%TEMP%\MangaMeeya_7z`（用于缓存），期间会产生与解压后大小相当的磁盘写入；缓存不会自动清理，可手动删除该目录。
+- 单个固实块内部的 LZMA2 解码无法多线程化，单块固实包只能单线程解码（但可立即返回第一页）；多块固实包才会用多个进程并行。
+- Susie 的 `fileInfo` 大小字段是 32 位，单个条目 ≥ 4GB 时数值会截断。
 - 右键菜单的注册写入 `HKCU\Software\Classes`，只对当前用户生效；在 Win11 默认菜单中位于“显示更多选项”。进入一级菜单需要 MSIX/IExplorerCommand 包，本补丁未实现。
 - 文件关联设置列表第 5 项（显示为 `....`）不注册（原版会生成无意义的 `HKCR\....`）。
 - IE 右键菜单（MenuExt）仍按原有逻辑写入 `HKCU\Software\Microsoft\Internet Explorer\MenuExt`；Edge 不使用该位置，因此只在旧版 IE 中有效。
@@ -162,18 +188,18 @@ MangaMeeya.exe        主程序（已开启 LAA，并导入 mmunicode.dll）
 mmunicode.dll         特殊字符文件名兼容层（新增）
 arc.dll               压缩包插件（已打 ZIP64 补丁）
 gif/jpg/png/jp2/pdf.dll
-SusiePlugin/          原版 Susie 插件 + 新增 webp.spi（WebP 解码）
+SusiePlugin/          原版 Susie 插件 + 新增 webp.spi（WebP 解码）、7z.spi + 7za.exe（7z 解压）
 AvisynthPlugin/       原版 Avisynth 插件
 docs/                 原版说明
 MangaMeeya 中文版说明.txt   原中文版作者说明
 original/             未修改的原版 MangaMeeya.exe / arc.dll（对照与回退用）
-patch-source/         补丁源码、应用脚本与预编译补丁块（含 unicode/、webp/、shellmenu/ 子目录）
+patch-source/         补丁源码、应用脚本与预编译补丁块（含 unicode/、webp/、shellmenu/、7z/ 子目录）
 SHA256SUMS.txt        补丁版与原版二进制的 SHA-256
 ```
 
 ### 重新打补丁
 
-见 [patch-source/README.md](patch-source/README.md)。需要 Python 3；重新汇编 `arc.dll` 补丁需要 NASM；重新编译 `mmunicode.dll` 或 `webp.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。文本页崩溃补丁和右键菜单补丁仅修改 `MangaMeeya.exe` 的机器码，Python 即可完成（右键菜单补丁的 `.bin` 已附带；修改汇编时才需要 NASM）。
+见 [patch-source/README.md](patch-source/README.md)。需要 Python 3；重新汇编 `arc.dll` 补丁需要 NASM；重新编译 `mmunicode.dll`、`webp.spi` 或 `7z.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。文本页崩溃补丁和右键菜单补丁仅修改 `MangaMeeya.exe` 的机器码，Python 即可完成（右键菜单补丁的 `.bin` 已附带；修改汇编时才需要 NASM）。
 
 ### 隐私
 
@@ -202,6 +228,7 @@ MangaMeeya 7.4 is a 32-bit application from 2006. It fails on:
 - file names containing characters the active ANSI code page cannot represent (for example U+30FB KATAKANA MIDDLE DOT “・” on a Simplified Chinese / CP936 system) — the character becomes `?` and the app reports an invalid path;
 - archives whose pages are `.txt` files (for example mod packs containing BepInEx localization text) — the app crashes with 0xC0000005 when two or more pages are prefetched (`PrepageForwardNum=2`);
 - **WebP images** cannot be read or displayed, and archives containing WebP entries do not render because there is no decoder;
+- **`.7z` archives cannot be opened** (arc.dll only supports ZIP/RAR/LZH and similar), and solid archives have no usable pre-extraction path at all;
 - on Windows 11 the **Explorer context-menu registration** in “File association settings” fails silently (a standard process cannot write `HKEY_CLASSES_ROOT`, and the app's manifest disables UAC virtualisation).
 
 This repository fixes those issues and ships a **ready-to-run** build.
@@ -280,6 +307,20 @@ No administrator rights are required, and Explorer honours the per-user class re
 
 > **Placement on Windows 11**: the default Windows 11 context menu only shows the new-style commands; all legacy shell verbs (including these) are under **“Show more options”** (Shift+F10). Putting an entry in the top-level menu requires an MSIX/sparse package with an `IExplorerCommand`; this patch does not implement that.
 
+#### 7. SusiePlugin/7z.spi + 7za.exe — 7z support and parallel solid-block extraction
+
+MangaMeeya's `arc.dll` does not support 7z. A 32-bit Susie archive plug-in, `SusiePlugin/7z.spi`, is added; it calls the bundled `7za.exe` (7-Zip 26.00 x86) located next to it:
+
+- **Non-solid archives** are extracted page by page through `7za x -so`; no cache is built.
+- **Solid archives**: `7za l -slt` reports `Blocks = N` in the header and `Block = k` for every file. LZMA2 decoding is sequential *within* a solid block, but blocks are independent, so the plug-in groups files by block and starts one `7za.exe` process per block (default `min(blocks, CPUs, 8)`, override with `MM7Z_THREADS`). Measured on 131MB / 3 blocks: about 2.7s with one process, versus about 3.8s of total CPU time and about 1.2s wall-clock with three processes.
+- **Page streaming**: files are extracted to `%TEMP%\MangaMeeya_7z\<hash>\` (the hash covers the archive path, size and modification time). `GetFile` waits only for the requested file to appear (size match plus CRC32 verification), so the first page does not wait for the whole archive; the remaining blocks keep decoding in the background as pages are displayed. Measured on a real 176MB / 800-page JPEG manga archive (3 blocks) open in MangaMeeya: the first page returns in about 0.1s, the three blocks finish decoding in about 0.7s, and browsing sequentially to page 800 completes without errors; a warm-cache pass over all 800 pages takes about 1s.
+- **UTF-8 names**: per-block file lists are passed through `-scsUTF-8` list files, so Japanese/Chinese directory and file names match correctly. This also fixes UTF-8 entry names being compared with `lstrcmpiA`, which under CP936 made `第1巻` and `第2巻` look identical.
+- **Cancellation**: a **non-zero** return from the 00AM `GetFile` progress callback terminates all decoder processes and returns error code 1 (note this is the opposite of the image-filter `GetPicture` convention, where zero cancels); the next read starts a fresh extraction.
+- Diagnostics: `MM7Z_LOG=1` writes startup, listing, block progress and error codes to `%TEMP%\7zspi.log`.
+
+> Requirement: `7z.spi`, `7za.exe` and `7z-License.txt` must be kept together in `SusiePlugin`. `7za.exe` comes from the official 7-Zip distribution and is covered by the 7-Zip license (`7z-License.txt`).
+> Why not “multi-thread the whole archive”: a single LZMA2 stream must be decoded sequentially from its start, so no decoder can split it across cores. What *can* run in parallel are separate solid blocks. A single-block solid archive therefore still has one decoder thread (but benefits from first-page streaming); multi-block archives gain real multi-core speedup.
+
 ### Verified
 
 | Scenario | Result |
@@ -304,6 +345,13 @@ No administrator rights are required, and Explorer honours the per-user class re
 | WebP-only ZIP / mixed JPEG+WebP ZIP | Correct page count; WebP pages render normally |
 | WebP files and WebP ZIPs whose names contain `・` | Open and render normally |
 | WebP with an alpha channel | Displays normally (alpha flattened onto white) |
+| Single-block solid 7z (120 entries / 131MB) | All entries listed and decoded; per-entry CRC verified |
+| Multi-block solid 7z (`Blocks = 3`, 120 entries) | Three decoder processes run in parallel; every CRC passes |
+| Multi-block solid 7z with Japanese directories/names (`第1巻/ページ・*.jpg`) | Listing, per-block extraction and CRC all pass |
+| Non-solid 7z (one independent block per file) | Per-entry `x -so` extraction works |
+| 7z memory-image input (`GetArchiveInfo` / `GetFile` with `flag=1`) | Works |
+| Cancelling during 7z extraction | Decoder processes are terminated and the call returns 1; the next read restarts extraction |
+| **Real 176MB / 800-page / 3-block JPEG manga archive (MangaMeeya GUI)** | Opens at 1/800 and displays; paging through to 800/800 works with no cancellation or errors; all three solid blocks decode in parallel |
 | Register `Folder` / `.zip` in File association settings | `HKCU\Software\Classes\...` command created; the shell enumerates “用MangaMeeya打开” |
 | Register `.jpg` / `.bmp` and other image types | Created under `SystemFileAssociations\<ext>`; visible in the file context menu |
 | Unregister | The corresponding HKCU keys are removed |
@@ -321,6 +369,10 @@ No administrator rights are required, and Explorer honours the per-user class re
 - WebP decoding depends on the system WIC WebP codec. Windows 11 normally includes it; on Windows 10 without “WebP Image Extensions” `webp.spi` cannot decode and may show a blank page.
 - Transparent WebP is flattened onto white (it does not show the viewer background); animated WebP shows only the first frame.
 - If `[Susie] PluginPath` is changed, `webp.spi` must be copied to that folder.
+- The 7z plug-in requires `7za.exe` in the same folder (shipped with the repository); removing or moving it makes 7z archives unopenable. Password-protected 7z archives (including encrypted headers) are not supported.
+- The first open of a solid 7z archive extracts the whole archive to `%TEMP%\MangaMeeya_7z` for caching, which writes roughly as much data as the extracted size. The cache is not cleaned automatically; delete that folder to reclaim space.
+- LZMA2 decoding within one solid block cannot be parallelised, so single-block solid archives use one decoder thread (the first page still arrives early); only multi-block solid archives use multiple parallel processes.
+- Susie's `fileInfo` size fields are 32-bit; entries ≥ 4GB are truncated.
 - The context menu is registered under `HKCU\Software\Classes`, so it is per-user and appears under “Show more options” on Windows 11. Putting it in the top-level menu requires an MSIX/IExplorerCommand package, which this patch does not provide.
 - The fifth entry in the file-association list (shown as `....`) is not registered (the original created a meaningless `HKCR\....` key).
 - The IE context menu (MenuExt) still uses the original `HKCU\Software\Microsoft\Internet Explorer\MenuExt` path; Edge does not read it, so it only affects legacy IE.
@@ -342,18 +394,18 @@ MangaMeeya.exe        main executable (LAA enabled, imports mmunicode.dll)
 mmunicode.dll         special-character file name compatibility layer (new)
 arc.dll               archive plugin (ZIP64 patched)
 gif/jpg/png/jp2/pdf.dll
-SusiePlugin/          original Susie plugins + new webp.spi (WebP decoder)
+SusiePlugin/          original Susie plugins + new webp.spi (WebP decoder), 7z.spi + 7za.exe (7z)
 AvisynthPlugin/       original Avisynth plugins
 docs/                 original documentation
 MangaMeeya 中文版说明.txt   original Chinese edition readme
 original/             unmodified MangaMeeya.exe / arc.dll (reference and rollback)
-patch-source/         patch sources, apply scripts and prebuilt blobs (incl. unicode/, webp/, shellmenu/)
+patch-source/         patch sources, apply scripts and prebuilt blobs (incl. unicode/, webp/, shellmenu/, 7z/)
 SHA256SUMS.txt        SHA-256 of patched and original binaries
 ```
 
 ### Rebuilding the patches
 
-See [patch-source/README.md](patch-source/README.md). Python 3 is required; NASM is required only to reassemble the `.asm` files, and a 32-bit (x86) MSVC or MinGW toolchain is required to rebuild `mmunicode.dll` or `webp.spi`. The text-page crash patch and the context-menu patch only rewrite machine code in `MangaMeeya.exe` and need Python only (the context-menu `.bin` is included; NASM is needed only if you modify the assembly).
+See [patch-source/README.md](patch-source/README.md). Python 3 is required; NASM is required only to reassemble the `.asm` files, and a 32-bit (x86) MSVC or MinGW toolchain is required to rebuild `mmunicode.dll` or `webp.spi`. The text-page crash patch and the context-menu patch only rewrite machine code in `MangaMeeya.exe` and need Python only (the context-menu `.bin` is included; NASM is needed only if you modify the assembly). A 32-bit toolchain is also required to rebuild `7z.spi`.
 
 ### Privacy
 

@@ -17,7 +17,12 @@
   - `MangaMeeya.exe` 的 Explorer 右键菜单注册逻辑（检查/写入/删除改为按用户写入 `HKCU\Software\Classes`，无需管理员权限）。
 - 新增 `mmunicode.dll`（C 源码见 `patch-source/unicode/`），用于解决 ANSI 代码页无法表示的特殊字符文件名；它不修改任何原有代码，只在进程内挂钩文件相关的 ANSI API。
 - 新增 `SusiePlugin/webp.spi`（C 源码见 `patch-source/webp/`），是 32 位 Susie 图像插件，通过 Windows Imaging Component（WIC）解码 WebP。它不修改原有程序或插件，WIC 解码器由操作系统提供。
+- 新增 `SusiePlugin/7z.spi`（C 源码见 `patch-source/7z/`），是 32 位 Susie 归档插件，运行时调用同目录的 `7za.exe` 解压 7z 档案。`7za.exe` 与 `7z-License.txt` 来自 7-Zip 官方发行包，版权归 Igor Pavlov，按 7-Zip 许可证（`SusiePlugin/7z-License.txt`）分发；本仓库未修改 `7za.exe`。
 - 未修改任何第三方插件的代码。
+
+## 第三方组件
+
+- **7-Zip / 7za.exe**（`SusiePlugin/7za.exe`）：Copyright (c) 1999-2026 Igor Pavlov，按 GNU LGPL、BSD 3-clause 及 unRAR restriction 发布，详见 `SusiePlugin/7z-License.txt` 与 <https://www.7-zip.org/license.txt>。`7z.spi` 仅以独立进程方式调用它，不链接其代码。
 
 ## 分发
 
