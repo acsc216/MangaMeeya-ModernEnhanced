@@ -17,9 +17,11 @@
  * per block and blocks are decoded in parallel on multiple cores.
  *
  * MangaMeeya reads pages one at a time, so GetFile also serves a page as
- * soon as its block has produced it - the first page appears without
- * waiting for the whole archive to be extracted.  The remainder keeps
- * decoding in the background while the reader displays pages.
+ * soon as it has been produced.  A single solid block is decoded on demand
+ * through one `7za x -so` stream: decoding pauses at "requested page +
+ * read-ahead window" instead of extracting the whole archive up front.
+ * Multi-block archives still use one process per block (parallel eager
+ * extraction, which is cheap because the blocks are independent).
  *
  * MangaMeeya passes fileInfo.position back as the "len" argument of
  * GetFile, so position is used as the entry identifier.
@@ -52,6 +54,9 @@
 #define ERR_BROKEN       3
 #define ERR_MEMORY       4
 
+#define STREAM_CHUNK    (256 * 1024)
+#define STREAM_PREFETCH (64ULL * 1024 * 1024)
+
 typedef int (__stdcall *PROGRESS_CB)(int, int, long);
 
 typedef struct {
@@ -74,6 +79,7 @@ typedef struct {
     long   mtime;
     int    is_dir;
     int    block;          /* solid block index, -1 if unknown */
+    ULONGLONG offset;      /* start offset in the archive's unpacked stream */
     ULONG  id;
     char   method[8];
 } ENTRY;
@@ -111,6 +117,16 @@ typedef struct ARCHIVE {
     int         worker_count;
     HANDLE      procs[MAX_WORKERS];
 
+    /* Single solid block: decode through one `7za x -so` stream on demand. */
+    BOOL        stream_mode;
+    BOOL        memcache;         /* keep decoded pages in the OS cache only */
+    HANDLE*     pins;             /* DELETE_ON_CLOSE handles that keep them */
+    BOOL        stream_started;
+    HANDLE      stream_thread;
+    HANDLE      stream_wake;      /* auto-reset: frontier raised / cancel */
+    volatile LONG stream_mb;      /* decoded position, MiB */
+    ULONGLONG   want_until;       /* decode at least up to this stream offset */
+
     ULONGLONG*  block_bytes;
     volatile LONG* block_pct;
     int         block_slots;
@@ -133,7 +149,12 @@ static BOOL g_lock_init;
 static ARCHIVE* g_archives;
 static WCHAR g_7za[MAX_PATH];
 static BOOL g_log;
+static BOOL g_memcache;
+static CRITICAL_SECTION g_logcs;
+static BOOL g_logcs_init;
 static int  g_threads;
+static ULONGLONG g_prefetch = STREAM_PREFETCH;
+static ULONGLONG g_cache_max = 5120ULL * 1024 * 1024;   /* 5 GB */
 static HANDLE g_job;
 static volatile LONG g_list_seq;
 static DWORD g_crc_table[256];
@@ -151,8 +172,10 @@ static void mm_logf(const char* fmt, ...)
     n = GetTempPathA(MAX_PATH, path);
     if (!n) return;
     lstrcatA(path, "7zspi.log");
+    if (g_logcs_init) EnterCriticalSection(&g_logcs);
     f = fopen(path, "a");
     if (f) { fprintf(f, "[%lu] %s\r\n", GetTickCount(), buf); fclose(f); }
+    if (g_logcs_init) LeaveCriticalSection(&g_logcs);
 }
 
 static void log_wide(const char* prefix, const WCHAR* w)
@@ -572,6 +595,25 @@ static void add_entry(ARCHIVE* a, ENTRY* e)
     a->count++;
 }
 
+/* Parse a hex value within one listing line.  _strtoul would skip the
+ * newline and consume digits from the next field (an empty "CRC =" line is
+ * followed by "Encrypted = -", whose 'E' parsed as 0x0E). */
+static DWORD parse_hex_n(const char* p, int len)
+{
+    DWORD v = 0;
+    int i;
+    for (i = 0; i < len; i++) {
+        char c = p[i];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else break;
+        v = (v << 4) | (DWORD)d;
+    }
+    return v;
+}
+
 static void flush_entry(ARCHIVE* a, ENTRY* cur, int* have)
 {
     if (!*have) return;
@@ -649,7 +691,7 @@ static void parse_listing(const char* text, ARCHIVE* a)
         } else if (KEYIS("Packed Size =")) {
             cur.packsize = _strtoui64(p + 14, NULL, 10);
         } else if (KEYIS("CRC =")) {
-            cur.crc = (DWORD)strtoul(p + 6, NULL, 16);
+            cur.crc = parse_hex_n(p + 6, ll - 6);
         } else if (KEYIS("Block =")) {
             cur.block = atoi(p + 8);
         } else if (KEYIS("Attributes =")) {
@@ -684,6 +726,12 @@ static void prepare_blocks(ARCHIVE* a)
 {
     int i, k;
     BOOL have_blocks = TRUE;
+    ULONGLONG off = 0;
+
+    for (i = 0; i < a->count; i++) {
+        a->entries[i].offset = off;
+        off += a->entries[i].size;
+    }
 
     for (i = 0; i < a->count; i++)
         if (a->entries[i].block < 0) have_blocks = FALSE;
@@ -709,6 +757,19 @@ static void prepare_blocks(ARCHIVE* a)
     } else {
         a->block_slots = 0;
     }
+
+    /* One solid block cannot be decoded in parallel and may be very large;
+     * decode it on demand instead of extracting the whole archive. */
+    a->stream_mode = a->solid && a->block_count <= 1 && a->count > 0;
+
+    /* Optional session-only memory cache: decoded pages live in the Windows
+     * cache manager (temporary + delete-on-close files).  The data never
+     * occupies this 32-bit process's address space and is deleted when the
+     * process exits; it is not reused across sessions. */
+    if (g_memcache && a->stream_mode && a->count > 0 && a->count <= 20000) {
+        a->pins = (HANDLE*)calloc(a->count, sizeof(HANDLE));
+        if (a->pins) a->memcache = TRUE;
+    }
 }
 
 static BOOL list_archive(ARCHIVE* a)
@@ -730,6 +791,162 @@ static BOOL list_archive(ARCHIVE* a)
 /* ------------------------------------------------------------------ */
 /* cache and list files                                                */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* cache size management (default cap: 5 GB)                           */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    WCHAR path[MAX_PATH * 2];
+    ULONGLONG size;
+    FILETIME last;
+} CACHEITEM;
+
+static ULONGLONG path_size(const WCHAR* path)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    WCHAR pat[MAX_PATH * 2];
+    ULONGLONG total = 0;
+
+    _snwprintf(pat, MAX_PATH * 2, L"%s\\*", path);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad))
+            return ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+        return 0;
+    }
+    do {
+        WCHAR child[MAX_PATH * 2];
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        _snwprintf(child, MAX_PATH * 2, L"%s\\%s", path, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            total += path_size(child);
+        else
+            total += ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return total;
+}
+
+static void delete_tree(const WCHAR* path)
+{
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    WCHAR pat[MAX_PATH * 2];
+    DWORD attr = GetFileAttributesW(path);
+
+    if (attr == INVALID_FILE_ATTRIBUTES) return;
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) { DeleteFileW(path); return; }
+
+    _snwprintf(pat, MAX_PATH * 2, L"%s\\*", path);
+    h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            WCHAR child[MAX_PATH * 2];
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            _snwprintf(child, MAX_PATH * 2, L"%s\\%s", path, fd.cFileName);
+            delete_tree(child);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryW(path);
+}
+
+static int cacheitem_cmp(const void* va, const void* vb)
+{
+    const CACHEITEM* a = (const CACHEITEM*)va;
+    const CACHEITEM* b = (const CACHEITEM*)vb;
+    if (a->last.dwHighDateTime != b->last.dwHighDateTime)
+        return a->last.dwHighDateTime < b->last.dwHighDateTime ? -1 : 1;
+    if (a->last.dwLowDateTime != b->last.dwLowDateTime)
+        return a->last.dwLowDateTime < b->last.dwLowDateTime ? -1 : 1;
+    return 0;
+}
+
+/* Keep the total cache under g_cache_max.  keep1 is the active archive's
+ * cache directory (never deleted); keep2 is its input file (only relevant
+ * for memory-image temp copies, which also live under the cache root).
+ * Entries touched in the last 10 minutes are left alone so a concurrently
+ * running MangaMeeya instance is not disturbed. */
+static void cache_cleanup(const WCHAR* keep1, const WCHAR* keep2)
+{
+    WCHAR temp[MAX_PATH], root[MAX_PATH * 2], pat[MAX_PATH * 2];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    CACHEITEM* items = NULL;
+    int n = 0, cap = 0, i;
+    ULONGLONG total = 0;
+    FILETIME now;
+    ULARGE_INTEGER nowu;
+
+    if (!g_cache_max) return;
+    if (!GetTempPathW(MAX_PATH, temp)) return;
+    _snwprintf(root, MAX_PATH * 2, L"%sMangaMeeya_7z", temp);
+    _snwprintf(pat, MAX_PATH * 2, L"%s\\*", root);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    GetSystemTimeAsFileTime(&now);
+    nowu.LowPart = now.dwLowDateTime;
+    nowu.HighPart = now.dwHighDateTime;
+
+    do {
+        WCHAR path[MAX_PATH * 2];
+        ULARGE_INTEGER lu;
+        ULONGLONG size;
+
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        _snwprintf(path, MAX_PATH * 2, L"%s\\%s", root, fd.cFileName);
+
+        if ((keep1 && !_wcsicmp(path, keep1)) || (keep2 && !_wcsicmp(path, keep2))) {
+            total += path_size(path);
+            continue;
+        }
+
+        lu.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+        lu.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        if (nowu.QuadPart - lu.QuadPart < 10ULL * 60 * 10000000) {
+            total += path_size(path);
+            continue;
+        }
+
+        size = path_size(path);
+        total += size;
+        if (n == cap) {
+            int ncap = cap ? cap * 2 : 32;
+            CACHEITEM* ni = (CACHEITEM*)realloc(items, sizeof(CACHEITEM) * ncap);
+            if (!ni) break;
+            items = ni;
+            cap = ncap;
+        }
+        items[n].size = size;
+        items[n].last = fd.ftLastWriteTime;
+        wcsncpy(items[n].path, path, MAX_PATH * 2 - 1);
+        items[n].path[MAX_PATH * 2 - 1] = 0;
+        n++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    if (n > 0 && total > g_cache_max) {
+        qsort(items, n, sizeof(CACHEITEM), cacheitem_cmp);
+        mm_logf("cache cleanup: %d old item(s), total %I64u, cap %I64u",
+                n, total, g_cache_max);
+        for (i = 0; i < n && total > g_cache_max; i++) {
+            ULONGLONG sz = items[i].size;
+            delete_tree(items[i].path);
+            if (GetFileAttributesW(items[i].path) == INVALID_FILE_ATTRIBUTES) {
+                total -= sz;
+                mm_logf("cache cleanup: removed %I64u bytes", sz);
+            } else {
+                mm_logf("cache cleanup: item in use, skipped");
+            }
+        }
+        mm_logf("cache cleanup: total now %I64u", total);
+    }
+    free(items);
+}
 
 static BOOL ensure_cache_dir(ARCHIVE* a)
 {
@@ -795,6 +1012,22 @@ static BOOL write_block_list(ARCHIVE* a, int block, const WCHAR* path)
     return ok;
 }
 
+static BOOL write_all_list(ARCHIVE* a, const WCHAR* path)
+{
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    int i; BOOL ok = TRUE;
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    for (i = 0; i < a->count; i++) {
+        ENTRY* e = &a->entries[i];
+        if (e->is_dir) continue;
+        if (!e->name_utf8 || !write_list_line(h, e->name_utf8, -1)) { ok = FALSE; break; }
+    }
+    CloseHandle(h);
+    if (!ok) DeleteFileW(path);
+    return ok;
+}
+
 static BOOL write_entry_list(ENTRY* e, const WCHAR* path)
 {
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
@@ -828,7 +1061,357 @@ static void cancel_extract(ARCHIVE* a)
     InterlockedExchange(&a->cancel, 1);
     for (i = 0; i < MAX_WORKERS; i++)
         if (a->procs[i]) TerminateProcess(a->procs[i], 1);
+    if (a->stream_wake) SetEvent(a->stream_wake);
     LeaveCriticalSection(&a->cs);
+}
+
+/* Open the cache file for a streamed entry.  When the file already exists
+ * with the expected size it is reused; the entry is still decoded but the
+ * data is discarded. */
+static void create_parent_dirs(const WCHAR* path)
+{
+    WCHAR tmp[MAX_PATH * 2];
+    int i, n = (int)wcslen(path);
+
+    if (n <= 3 || n >= MAX_PATH * 2) return;
+    wcscpy(tmp, path);
+    for (i = 3; i < n; i++) {
+        if (tmp[i] == L'\\') {
+            tmp[i] = 0;
+            CreateDirectoryW(tmp, NULL);
+            tmp[i] = L'\\';
+        }
+    }
+}
+
+static HANDLE open_stream_entry(ARCHIVE* a, int idx, ENTRY* e, BOOL* skip, BOOL* fail)
+{
+    WCHAR path[MAX_PATH * 2];
+    HANDLE h;
+    LARGE_INTEGER sz;
+
+    *skip = FALSE;
+    *fail = FALSE;
+    if (!build_cache_path(a, e->name_w, path, MAX_PATH * 2)) {
+        mm_logf("stream: bad cache path for %s", e->name_utf8 ? e->name_utf8 : "?");
+        *skip = TRUE;
+        return INVALID_HANDLE_VALUE;
+    }
+
+    if (a->memcache) {
+        /* Temporary + delete-on-close: the cache manager disables the lazy
+         * writer, so the data stays in RAM (spilling only under memory
+         * pressure) and the file disappears when the process exits.  The
+         * handle is kept open in a->pins to keep the file alive. */
+        create_parent_dirs(path);
+        h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE | DELETE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            mm_logf("memcache: create failed err=%lu path=%hs", GetLastError(),
+                    e->name_utf8 ? e->name_utf8 : "?");
+            *skip = TRUE;
+            *fail = TRUE;
+            return INVALID_HANDLE_VALUE;
+        }
+        if (a->pins && idx >= 0 && idx < a->count) a->pins[idx] = h;
+        return h;
+    }
+
+    h = CreateFileW(path, GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        if (GetFileSizeEx(h, &sz) && (ULONGLONG)sz.QuadPart == e->size) {
+            CloseHandle(h);
+            *skip = TRUE;
+            return INVALID_HANDLE_VALUE;
+        }
+        CloseHandle(h);
+    }
+    create_parent_dirs(path);
+    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        mm_logf("stream: create failed err=%lu path=%hs", GetLastError(),
+                e->name_utf8 ? e->name_utf8 : "?");
+        *skip = TRUE;
+        *fail = TRUE;
+    }
+    return h;
+}
+
+/* Single solid block: one `7za x -so` process produces the archive's
+ * unpacked stream in archive order.  We split it by the sizes from the
+ * listing and write the entries to the cache.  Decoding stops (the pipe
+ * provides natural back-pressure) once everything up to want_until has
+ * been produced, so opening a 2GB solid archive does not decode it all. */
+static unsigned __stdcall stream_reader(void* param)
+{
+    ARCHIVE* a = (ARCHIVE*)param;
+    WCHAR listpath[MAX_PATH * 2];
+    WCHAR cmd[32768];
+    SECURITY_ATTRIBUTES sa;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    HANDLE rpipe = NULL, wpipe = NULL, nul = INVALID_HANDLE_VALUE;
+    HANDLE out = INVALID_HANDLE_VALUE;
+    BYTE* chunk = NULL;
+    DWORD rc = (DWORD)-1;
+    ULONGLONG pos = 0;
+    int idx = 0;
+    BOOL opened = FALSE, skip = FALSE, fail = FALSE, cancelled = FALSE;
+    BOOL pause_logged = FALSE;
+    DWORD got;
+    LONG last_mb = -1;
+
+    listpath[0] = 0;
+    ZeroMemory(&pi, sizeof(pi));
+    chunk = (BYTE*)malloc(STREAM_CHUNK);
+    if (!chunk || !make_list_path(a, listpath, MAX_PATH * 2) ||
+        !write_all_list(a, listpath)) {
+        fail = TRUE;
+        goto done;
+    }
+    _snwprintf(cmd, 32768, L"\"%s\" x -so -y -scsUTF-8 \"%s\" @\"%s\"",
+               g_7za, a->archive_w, listpath);
+    log_wide("stream: ", cmd);
+
+    ZeroMemory(&sa, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    if (!CreatePipe(&rpipe, &wpipe, &sa, 1 << 20)) { fail = TRUE; goto done; }
+    SetHandleInformation(rpipe, HANDLE_FLAG_INHERIT, 0);
+    nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    if (nul == INVALID_HANDLE_VALUE) { fail = TRUE; goto done; }
+    mm_logf("stream: pipe ok");
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = wpipe;
+    si.hStdError = nul;      /* never mix diagnostics into the data stream */
+    si.hStdInput = nul;
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        mm_logf("stream: CreateProcess failed err=%lu", GetLastError());
+        fail = TRUE;
+        goto done;
+    }
+    mm_logf("stream: process started pid=%lu", pi.dwProcessId);
+    CloseHandle(wpipe); wpipe = NULL;
+    CloseHandle(nul); nul = INVALID_HANDLE_VALUE;
+    CloseHandle(pi.hThread);
+    if (g_job) AssignProcessToJobObject(g_job, pi.hProcess);
+    EnterCriticalSection(&a->cs);
+    a->procs[0] = pi.hProcess;
+    LeaveCriticalSection(&a->cs);
+
+    for (;;) {
+        DWORD off;
+
+        if (a->cancel) { cancelled = TRUE; break; }
+        if (idx >= a->count || pos >= a->total_bytes)
+            break;   /* everything decoded - drain EOF and finish */
+
+        /* Wait at the current frontier; getfile raises want_until. */
+        {
+            ULONGLONG want;
+            EnterCriticalSection(&a->cs);
+            want = a->want_until;
+            LeaveCriticalSection(&a->cs);
+            if (pos >= want) {
+                if (!pause_logged) {
+                    pause_logged = TRUE;
+                    mm_logf("stream: paused pos=%I64u want=%I64u", pos, want);
+                }
+                WaitForSingleObject(a->stream_wake, 200);
+                continue;
+            }
+            pause_logged = FALSE;
+        }
+
+        if (!ReadFile(rpipe, chunk, STREAM_CHUNK, &got, NULL) || got == 0) {
+            mm_logf("stream: eof got=%lu err=%lu", got, GetLastError());
+            break;
+        }
+
+        off = 0;
+        while (off < got) {
+            ENTRY* e;
+            ULONGLONG remain;
+            DWORD n;
+
+            if (idx >= a->count) { off = got; break; }
+            e = &a->entries[idx];
+            remain = e->size - (pos - e->offset);
+
+            if (!opened) {
+                out = open_stream_entry(a, idx, e, &skip, &fail);
+                opened = TRUE;
+                if (e->size == 0) {
+                    if (out != INVALID_HANDLE_VALUE && !a->memcache) CloseHandle(out);
+                    out = INVALID_HANDLE_VALUE;
+                    idx++; opened = FALSE;
+                    continue;
+                }
+            }
+
+            n = (DWORD)((ULONGLONG)(got - off) < remain ? (got - off) : remain);
+            if (out != INVALID_HANDLE_VALUE) {
+                DWORD wr = 0;
+                if (!WriteFile(out, chunk + off, n, &wr, NULL) || wr != n)
+                    fail = TRUE;
+            }
+            off += n;
+            pos += n;
+            if (pos >= e->offset + e->size) {
+                if (out != INVALID_HANDLE_VALUE && !a->memcache) CloseHandle(out);
+                out = INVALID_HANDLE_VALUE;
+                idx++;
+                opened = FALSE;
+            }
+        }
+
+        {
+            LONG mb = (LONG)(pos >> 20);
+            if (mb != last_mb) {
+                last_mb = mb;
+                InterlockedExchange(&a->stream_mb, mb);
+            }
+        }
+    }
+
+    /* Drain the rest (normally empty); lets 7za exit cleanly. */
+    if (!cancelled && rpipe) {
+        while (ReadFile(rpipe, chunk, STREAM_CHUNK, &got, NULL) && got > 0)
+            ;
+    }
+    CloseHandle(rpipe); rpipe = NULL;
+    mm_logf("stream: waiting for process, pos=%I64u idx=%d/%d", pos, idx, a->count);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &rc);
+    mm_logf("stream: process exit rc=%lu", rc);
+    EnterCriticalSection(&a->cs);
+    a->procs[0] = NULL;
+    LeaveCriticalSection(&a->cs);
+    CloseHandle(pi.hProcess);
+    pi.hProcess = NULL;
+
+    /* Materialize trailing empty files (they produce no stream bytes). */
+    while (idx < a->count && a->entries[idx].size == 0) {
+        ENTRY* e = &a->entries[idx];
+        out = open_stream_entry(a, idx, e, &skip, &fail);
+        if (out != INVALID_HANDLE_VALUE && !a->memcache) CloseHandle(out);
+        out = INVALID_HANDLE_VALUE;
+        idx++;
+    }
+
+done:
+    if (out != INVALID_HANDLE_VALUE && !a->memcache) CloseHandle(out);
+    out = INVALID_HANDLE_VALUE;
+    if (rpipe) CloseHandle(rpipe);
+    if (wpipe) CloseHandle(wpipe);
+    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    if (pi.hProcess) CloseHandle(pi.hProcess);
+    if (listpath[0]) DeleteFileW(listpath);
+    free(chunk);
+
+    EnterCriticalSection(&a->cs);
+    if (cancelled || a->cancel) {
+        InterlockedExchange(&a->extract_cancelled, 1);
+        mm_logf("stream cancelled at %I64u", pos);
+    } else if (fail || rc != 0 || idx < a->count) {
+        a->worker_failed = TRUE;
+        InterlockedExchange(&a->extract_failed, 1);
+        InterlockedExchange(&a->cancel, 1);
+        mm_logf("stream failed rc=%lu idx=%d/%d fail=%d", rc, idx, a->count, fail);
+    } else {
+        if (!a->memcache) write_cache_marker(a);
+        a->cache_ready = TRUE;
+        mm_logf("stream complete: %I64u bytes", pos);
+    }
+    SetEvent(a->done_event);
+    LeaveCriticalSection(&a->cs);
+    return 0;
+}
+
+static BOOL ensure_stream_started(ARCHIVE* a)
+{
+    int i;
+
+    if (a->cache_ready) return TRUE;
+
+    EnterCriticalSection(&a->cs);
+
+    if (a->stream_started) {
+        if (!a->extract_failed && !a->extract_cancelled &&
+            !InterlockedCompareExchange(&a->cancel, 0, 0)) {
+            LeaveCriticalSection(&a->cs);   /* decoding / paused */
+            return TRUE;
+        }
+        LeaveCriticalSection(&a->cs);
+        if (a->stream_thread) WaitForSingleObject(a->stream_thread, 15000);
+        EnterCriticalSection(&a->cs);
+        if (a->cache_ready) { LeaveCriticalSection(&a->cs); return TRUE; }
+        if (a->extract_failed) { LeaveCriticalSection(&a->cs); return TRUE; }
+        /* cancelled by the caller - restart from the beginning */
+        if (a->stream_thread) {
+            CloseHandle(a->stream_thread);
+            a->stream_thread = NULL;
+        }
+        a->stream_started = FALSE;
+        a->worker_failed = FALSE;
+        InterlockedExchange(&a->extract_failed, 0);
+        InterlockedExchange(&a->extract_cancelled, 0);
+        InterlockedExchange(&a->cancel, 0);
+        InterlockedExchange(&a->stream_mb, 0);
+        a->want_until = 0;
+        a->procs[0] = NULL;
+        ResetEvent(a->done_event);
+        if (a->pins) {
+            for (i = 0; i < a->count; i++)
+                if (a->pins[i]) { CloseHandle(a->pins[i]); a->pins[i] = NULL; }
+        }
+    }
+
+    if (!ensure_cache_dir(a)) {
+        InterlockedExchange(&a->extract_failed, 1);
+        SetEvent(a->done_event);
+        LeaveCriticalSection(&a->cs);
+        return FALSE;
+    }
+    if (!a->memcache && cache_marker_exists(a)) {
+        a->cache_ready = TRUE;
+        LeaveCriticalSection(&a->cs);
+        return TRUE;
+    }
+
+    if (!a->stream_wake)
+        a->stream_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!a->stream_wake) {
+        InterlockedExchange(&a->extract_failed, 1);
+        SetEvent(a->done_event);
+        LeaveCriticalSection(&a->cs);
+        return FALSE;
+    }
+
+    a->want_until = 0;
+    InterlockedExchange(&a->stream_mb, 0);
+    a->stream_started = TRUE;
+    a->stream_thread = (HANDLE)_beginthreadex(NULL, 0, stream_reader, a, 0, NULL);
+    if (!a->stream_thread) {
+        a->stream_started = FALSE;
+        InterlockedExchange(&a->extract_failed, 1);
+        SetEvent(a->done_event);
+        LeaveCriticalSection(&a->cs);
+        return FALSE;
+    }
+    LeaveCriticalSection(&a->cs);
+    return TRUE;
 }
 
 static unsigned __stdcall worker_proc(void* param)
@@ -927,6 +1510,9 @@ static void free_workers(ARCHIVE* a)
 static BOOL ensure_extract_started(ARCHIVE* a)
 {
     int i, k, threads, wcount, slots;
+
+    if (a->stream_mode)
+        return ensure_stream_started(a);
 
     EnterCriticalSection(&a->cs);
 
@@ -1064,9 +1650,17 @@ static int read_cache_entry(ARCHIVE* a, ENTRY* e, BYTE** out, DWORD* out_size)
     h = CreateFileW(path, GENERIC_READ,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE)
+    if (h == INVALID_HANDLE_VALUE) {
+        mm_logf("read id=%lu open failed err=%lu size=%I64u", e->id, GetLastError(), e->size);
         return CACHE_NOT_READY;
-    if (!GetFileSizeEx(h, &sz) || (ULONGLONG)sz.QuadPart != e->size) {
+    }
+    if (!GetFileSizeEx(h, &sz)) {
+        CloseHandle(h);
+        return CACHE_NOT_READY;
+    }
+    if ((ULONGLONG)sz.QuadPart != e->size) {
+        mm_logf("read id=%lu size=%I64d want=%I64u", e->id,
+                (LONGLONG)sz.QuadPart, e->size);
         CloseHandle(h);
         return CACHE_NOT_READY;
     }
@@ -1084,6 +1678,8 @@ static int read_cache_entry(ARCHIVE* a, ENTRY* e, BYTE** out, DWORD* out_size)
     }
     CloseHandle(h);
     if (e->crc && crc32_buf(buf, (DWORD)e->size) != e->crc) {
+        mm_logf("read id=%lu crc mismatch got=%08lx want=%08lx",
+                e->id, crc32_buf(buf, (DWORD)e->size), e->crc);
         LocalFree(buf);
         return CACHE_NOT_READY; /* extraction will report a CRC failure */
     }
@@ -1128,28 +1724,62 @@ static int wait_for_entry(ARCHIVE* a, ENTRY* e, PROGRESS_CB cb, long lData,
     last_cb = t0 = GetTickCount();
 
     for (;;) {
-        int r = read_cache_entry(a, e, out, out_size);
+        int r;
+
+        if (a->stream_mode) {
+            /* Ask the decoder to go at least through this entry plus a
+             * read-ahead window.  It stays paused otherwise. */
+            ULONGLONG need = e->offset + e->size;
+            if (need < a->total_bytes) need += g_prefetch;
+            if (need > a->total_bytes) need = a->total_bytes;
+            EnterCriticalSection(&a->cs);
+            if (need > a->want_until) {
+                a->want_until = need;
+                if (a->stream_wake) SetEvent(a->stream_wake);
+            }
+            LeaveCriticalSection(&a->cs);
+        }
+
+        r = read_cache_entry(a, e, out, out_size);
         if (r == CACHE_OK) {
             mm_logf("served id=%lu in %lu ms (pct=%d)", e->id,
                     GetTickCount() - t0, archive_pct(a));
             if (cb) cb(1, 1, lData);
             return 0;
         }
-        if (r == CACHE_ERROR) return ERR_MEMORY;
-        if (InterlockedCompareExchange(&a->extract_failed, 0, 0)) return ERR_BROKEN;
+        if (r == CACHE_ERROR) {
+            mm_logf("wait id=%lu: cache error", e->id);
+            return ERR_MEMORY;
+        }
+        if (InterlockedCompareExchange(&a->extract_failed, 0, 0)) {
+            mm_logf("wait id=%lu: extraction failed", e->id);
+            return ERR_BROKEN;
+        }
         if (InterlockedCompareExchange(&a->extract_cancelled, 0, 0)) return 1;
 
         if (WaitForSingleObject(a->done_event, 0) == WAIT_OBJECT_0) {
             /* extraction finished successfully but this entry is absent/bad */
             r = read_cache_entry(a, e, out, out_size);
             if (r == CACHE_OK) { if (cb) cb(1, 1, lData); return 0; }
+            mm_logf("wait id=%lu: done but read=%d", e->id, r);
             return ERR_BROKEN;
         }
         if (cb) {
             DWORD now = GetTickCount();
             if (now - last_cb >= 80) {
+                int pct;
                 last_cb = now;
-                if (cb(archive_pct(a), 100, lData) != 0) {
+                if (a->stream_mode) {
+                    ULONGLONG end = e->offset + e->size;
+                    ULONGLONG pos = (ULONGLONG)(ULONG)InterlockedCompareExchange(
+                                        &a->stream_mb, 0, 0) << 20;
+                    pct = end ? (int)(pos * 100 / end) : 99;
+                    if (pct > 99) pct = 99;
+                    if (pct < 0) pct = 0;
+                } else {
+                    pct = archive_pct(a);
+                }
+                if (cb(pct, 100, lData) != 0) {
                     cancel_extract(a);
                     return 1;
                 }
@@ -1175,7 +1805,7 @@ static BYTE* extract_direct(ARCHIVE* a, ENTRY* e, DWORD* out_size, int* err)
                g_7za, a->archive_w, listpath);
     rc = run_7za(cmd, &out, &size, TRUE, NULL);
     DeleteFileW(listpath);
-    if (rc != 0 || !out) {
+    if (rc != 0) {
         free(out);
         mm_logf("extract-one failed rc=%lu", rc);
         return NULL;
@@ -1183,7 +1813,7 @@ static BYTE* extract_direct(ARCHIVE* a, ENTRY* e, DWORD* out_size, int* err)
     {
         BYTE* lb = (BYTE*)LocalAlloc(LMEM_FIXED, size ? size : 1);
         if (!lb) { free(out); *err = ERR_MEMORY; return NULL; }
-        memcpy(lb, out, size);
+        if (size && out) memcpy(lb, out, size);
         free(out);
         *out_size = size;
         *err = 0;
@@ -1269,7 +1899,15 @@ static ARCHIVE* get_archive(LPCSTR src, long len, UINT flag, BOOL mem_size_valid
 
     a->next = g_archives;
     g_archives = a;
-    if (!list_archive(a)) { *err = TRUE; }
+    if (!list_archive(a)) {
+        *err = TRUE;
+    } else {
+        if (a->memcache) {
+            int n = (int)wcslen(a->cache_w);
+            if (n + 5 < MAX_PATH * 2) wcscat(a->cache_w, L"_mem");
+        }
+        cache_cleanup(a->cache_w, a->archive_w);
+    }
     return a;
 }
 
@@ -1289,7 +1927,7 @@ __declspec(dllexport) int WINAPI GetPluginInfo(int infono, LPSTR buf, int buflen
 {
     switch (infono) {
     case 0: return copy_info("00AM", buf, buflen);
-    case 1: return copy_info("7z Archive Plug-in v1.1 (parallel solid blocks)", buf, buflen);
+    case 1: return copy_info("7z Archive Plug-in v1.4 (on-demand / parallel / cache cap)", buf, buflen);
     case 2: return copy_info("*.7Z", buf, buflen);
     case 3: return copy_info("7z Archive", buf, buflen);
     default: return 0;
@@ -1467,8 +2105,47 @@ BOOL WINAPI DllMain(HMODULE hm, DWORD reason, LPVOID p)
         g_self = hm;
         InitializeCriticalSection(&g_lock);
         g_lock_init = TRUE;
+        InitializeCriticalSection(&g_logcs);
+        g_logcs_init = TRUE;
         DisableThreadLibraryCalls(hm);
         crc32_init();
+
+        /* Configuration file: SusiePlugin\7z.ini (preferred), or the [7z]
+         * section of MangaMeeya.ini next to the application.  Environment
+         * variables, read below, override these values. */
+        {
+            WCHAR ini[MAX_PATH], appini[MAX_PATH * 2];
+            get_plugin_dir(ini, MAX_PATH);
+            _snwprintf(appini, MAX_PATH * 2, L"%s..\\MangaMeeya.ini", ini);
+            if (wcslen(ini) + 8 < MAX_PATH) wcscat(ini, L"7z.ini");
+            if (GetFileAttributesW(ini) == INVALID_FILE_ATTRIBUTES) {
+                if (GetFileAttributesW(appini) != INVALID_FILE_ATTRIBUTES) {
+                    wcsncpy(ini, appini, MAX_PATH - 1);
+                    ini[MAX_PATH - 1] = 0;
+                } else {
+                    ini[0] = 0;
+                }
+            }
+            if (ini[0]) {
+                int n;
+                n = (int)GetPrivateProfileIntW(L"7z", L"CacheMaxMB", (UINT)-1, ini);
+                if (n >= 0 && n <= 1024 * 1024)     /* 0 = no cleanup */
+                    g_cache_max = (ULONGLONG)n * 1024ULL * 1024ULL;
+                n = (int)GetPrivateProfileIntW(L"7z", L"PrefetchMB", (UINT)-1, ini);
+                if (n >= 0 && n <= 4096)
+                    g_prefetch = (ULONGLONG)n * 1024ULL * 1024ULL;
+                n = (int)GetPrivateProfileIntW(L"7z", L"Threads", (UINT)-1, ini);
+                if (n >= 0 && n <= MAX_WORKERS)
+                    g_threads = n;
+                n = (int)GetPrivateProfileIntW(L"7z", L"MemCache", (UINT)-1, ini);
+                if (n >= 0)
+                    g_memcache = (n != 0);
+                n = (int)GetPrivateProfileIntW(L"7z", L"Log", (UINT)-1, ini);
+                if (n > 0)
+                    g_log = TRUE;
+            }
+        }
+
         if (GetEnvironmentVariableA("MM7Z_LOG", v, sizeof(v)) > 0 && v[0] == '1')
             g_log = TRUE;
         if (GetEnvironmentVariableA("MM7Z_THREADS", v, sizeof(v)) > 0) {
@@ -1476,6 +2153,18 @@ BOOL WINAPI DllMain(HMODULE hm, DWORD reason, LPVOID p)
             if (n < 1) n = 1;
             if (n > MAX_WORKERS) n = MAX_WORKERS;
             g_threads = n;
+        }
+        if (GetEnvironmentVariableA("MM7Z_PREFETCH", v, sizeof(v)) > 0) {
+            int n = atoi(v);   /* MiB */
+            if (n >= 0 && n <= 4096)
+                g_prefetch = (ULONGLONG)n * 1024ULL * 1024ULL;
+        }
+        if (GetEnvironmentVariableA("MM7Z_MEMCACHE", v, sizeof(v)) > 0 && v[0] == '1')
+            g_memcache = TRUE;
+        if (GetEnvironmentVariableA("MM7Z_CACHE_MAX_MB", v, sizeof(v)) > 0) {
+            int n = atoi(v);
+            if (n >= 0 && n <= 1024 * 1024)   /* 0 = no cleanup */
+                g_cache_max = (ULONGLONG)n * 1024ULL * 1024ULL;
         }
         g_job = CreateJobObjectW(NULL, NULL);
         if (g_job) {

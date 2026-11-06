@@ -106,14 +106,18 @@ Windows 7 以后，普通权限进程不能写 `HKEY_CLASSES_ROOT`；MangaMeeya 
 MangaMeeya 的 `arc.dll` 不支持 7z。新增 32 位 Susie 归档插件 `SusiePlugin/7z.spi`，它调用同目录的 `7za.exe`（7-Zip 26.00 x86，随包附带）完成解码：
 
 - **非固实档案**：直接 `7za x -so` 把单页流式取到内存，不建缓存；
-- **固实档案**：`7za l -slt` 的头部给出 `Blocks = N`，每个条目带有 `Block = k`。LZMA2 在单个固实块内部只能顺序解码，但**块与块相互独立**，因此插件按块分组，为每块启动一个 `7za.exe` 进程并行解压（默认 `min(块数, CPU 数, 8)`，可用 `MM7Z_THREADS` 调整）。实测 156MB / 3 块随机数据：单进程约 2.7s，3 进程并行 CPU 总时间约 3.8s、墙钟约 1.2s；
-- **按页流式返回**：解压到 `%TEMP%\MangaMeeya_7z\<hash>\`（`<hash>` 由档案完整路径、大小、修改时间决定）。`GetFile` 只等待目标文件写完（大小匹配并用 CRC32 校验），第一页无需等整包解压完；MangaMeeya 翻页时后台继续解压其余块。实测 176MB / 800 页真实 JPEG 漫画包（3 块）在 MangaMeeya 中打开：第一页约 0.1s 返回，三个块约 0.7s 并行解压完毕，顺序翻到第 800 页无错误；缓存就绪后整本顺序读取约 1s；
+- **多块固实档案**：`7za l -slt` 的头部给出 `Blocks = N`，每个条目带有 `Block = k`。LZMA2 在单个固实块内部只能顺序解码，但**块与块相互独立**，因此插件按块分组，为每块启动一个 `7za.exe` 进程并行解压（默认 `min(块数, CPU 数, 8)`，可用 `MM7Z_THREADS` 调整）。实测 156MB / 3 块：单进程约 2.7s，3 进程并行 CPU 总时间约 3.8s、墙钟约 1.2s；
+- **单块固实档案按需解码**：`Blocks = 1`（漫画包最常见）时，插件常驻一个 `7za x -so` 进程，按**归档顺序**输出解压流，再按列表中的文件大小切分写入缓存。`GetFile` 只把解码前沿推进到“当前页 + 预读窗口”（默认 64 MB，`MM7Z_PREFETCH` 可调）；没有新请求时解码停在原处，**不会在后台把整包解完**。目标文件写完（大小匹配 + CRC32）即返回。实测 1.82 GB / 单块 / 解压后 2.4 GB 的 BallonsTranslator 导出包：在 MangaMeeya 中打开并显示第 64 页约 **1.7 s**，解码在约 **356 MB** 处暂停；只有跳到更靠后的页时才继续解码（跳到最后一页约 19 s，单块顺序解码无法避免）；全部解码后写入 `.done`，之后打开直接读缓存（约 0.3 s）。多块包的并行预解压路径保持不变；
+- **缓存**：位于 `%TEMP%\MangaMeeya_7z\<hash>\`，`<hash>` 由档案完整路径、大小、修改时间决定；已存在的完整文件在重新解码时直接复用（跳过写入）；
+- **会话级内存缓存（可选）**：`MM7Z_MEMCACHE=1` 时，单块按需解码写出的页面使用 `FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE` 并保持一个“钉住”句柄。Windows 缓存管理器会把数据留在内存中（仅在内存压力下回写磁盘），**不占用 32 位进程的地址空间**；MangaMeeya 退出时文件自动删除，不在 `%TEMP%` 留下残留。代价是不跨会话复用（下次打开重新解码）；内存不足时仍会落盘。默认关闭，使用持久磁盘缓存；
+- **压缩端建议**：官方推荐的随机访问做法是使用多个较小的固实块，例如 `7z a -ms=64m`（漫画可用 `-ms=16m`）；实测 `-ms=64m` 把 200MB 数据分成 4 块，插件用 4 个进程并行解码。若追求每页独立读取，应使用 `-ms=off` 或 ZIP（MangaMeeya 原生支持）；
+- **缓存上限与配置**：配置文件为 `SusiePlugin\7z.ini`（`[7z]` 段），`CacheMaxMB` 默认 **5120（5 GB）**，设为 0 可关闭自动清理。每次打开档案时统计 `%TEMP%\MangaMeeya_7z` 的总大小，超过上限就按“最久未使用”删除旧缓存目录；当前打开的档案和最近 10 分钟用过的缓存不会被删。同文件还支持 `PrefetchMB`、`Threads`、`MemCache`、`Log`；环境变量 `MM7Z_*` 优先级更高。若没有 `7z.ini`，会读取 `MangaMeeya.ini` 的 `[7z]` 段；
 - **UTF-8 文件名**：条目清单通过 `-scsUTF-8` 列表文件传给 7za，含日文/中文目录和文件名也能正确匹配；同时修复了用 `lstrcmpiA` 比较 UTF-8 名称时在 CP936 下把 `第1巻` 与 `第2巻` 误判为同一文件的问题；
 - **取消**：Susie 00AM 的 `GetFile` 进度回调返回**非 0** 时立即终止所有解码子进程并返回错误码 1（注意与图像插件 `GetPicture` 的“返回 0 取消”相反）；下次读取会自动重新开始解压；
-- 诊断：设置 `MM7Z_LOG=1` 可把启动、列表、块进度和错误码写入 `%TEMP%\7zspi.log`。
+- 诊断：设置 `MM7Z_LOG=1` 可把启动、列表、解码暂停/完成和错误码写入 `%TEMP%\7zspi.log`；`MM7Z_PREFETCH=n` 设置单块固实包的预读窗口（MiB，默认 64，0 表示只解到当前页）。
 
 > 依赖：`7z.spi`、`7za.exe`、`7z-License.txt` 必须一起放在 `SusiePlugin`。`7za.exe` 来自 7-Zip 官方发行包，遵循 7-Zip 许可证（见 `7z-License.txt`）。
-> 为什么不能“整包多线程”：单个 LZMA2 流必须从头顺序解码，任何解码器都无法把它拆到多个核心；能并行的是**不同的固实块**。因此单块固实包仍然只有一个解码线程（但具备第一页先到的流式效果），多块固实包才能获得多核加速。
+> 为什么不能“整包多线程”：7-Zip 作者 Igor Pavlov 明确说明单个 LZMA/LZMA2 流无法多线程解码；LZMA2 虽然可以把流切成独立块，但 7-Zip 的解码端并未实现该并行路径。能并行的是**不同的固实块**（`-ms=64m` 之类的小块），因此单块固实包仍然只有一个解码线程（但具备第一页先到、按需暂停和可选内存缓存），多块固实包才能获得多核加速。
 
 ### 已验证场景
 
@@ -146,6 +150,10 @@ MangaMeeya 的 `arc.dll` 不支持 7z。新增 32 位 Susie 归档插件 `SusieP
 | 7z 内存映像输入（`GetArchiveInfo` / `GetFile` 的 `flag=1`） | 正常 |
 | 7z 解压过程中取消 | 立即终止解码进程并返回 1；再次读取时重新解压 |
 | **176MB / 800 页 / 3 块的真实 JPEG 漫画包（MangaMeeya GUI）** | 打开后 1/800 正常显示；翻页到 800/800 全程正常，无取消/错误；三个固实块并行解压 |
+| **1.82GB 单块固实包（解压后 2.4GB，BallonsTranslator 导出）** | 打开并显示第 64 页约 1.7s，解码在约 356MB 处暂停（不再后台解完整包）；跳到最后一页约 19s 后完成并写入 `.done`，CRC 校验通过；之后打开直接读缓存 |
+| 单块固实包只读前 8 条（冷缓存） | 1.75s，缓存 285MB，日志显示 `paused`；未解码部分保持未解 |
+| 单块固实包跳到末页（从部分缓存） | 19.2s 完成，2.4GB，`.done` 写入，末页 CRC 正确 |
+| 全空文件包 / 非固实包 / 多块固实包 | 回归通过 |
 | 文件关联设置勾选 `Folder` / `.zip` 并确定 | `HKCU\Software\Classes\...` 生成 command，Shell 能枚举到“用MangaMeeya打开” |
 | 勾选 `.jpg` / `.bmp` 等图片类型 | `SystemFileAssociations\<ext>` 下生成，对应文件右键菜单可见 |
 | 取消注册 | 对应 HKCU 键被删除 |
@@ -164,8 +172,12 @@ MangaMeeya 的 `arc.dll` 不支持 7z。新增 32 位 Susie 归档插件 `SusieP
 - 透明 WebP 会合成到白底（不会穿透到 MangaMeeya 的背景色）；动画 WebP 只显示第一帧。
 - 如果用户修改了 `[Susie] PluginPath`，需要把 `webp.spi` 复制到对应目录。
 - 7z 插件依赖同目录的 `7za.exe`（随包附带）；删除或移动它会导致 7z 无法打开。加密的 7z（含加密文件名）不支持。
-- 7z 固实包首次打开会把整包解压到 `%TEMP%\MangaMeeya_7z`（用于缓存），期间会产生与解压后大小相当的磁盘写入；缓存不会自动清理，可手动删除该目录。
-- 单个固实块内部的 LZMA2 解码无法多线程化，单块固实包只能单线程解码（但可立即返回第一页）；多块固实包才会用多个进程并行。
+- 单块固实包按需解码：只解到“当前页 + 预读窗口”就暂停，缓存大小随阅读进度增长；完整解码过一次后才会写 `.done`，之后打开可直接读缓存。缓存不会自动清理，可手动删除 `%TEMP%\MangaMeeya_7z`。
+- 单块固实包跳到靠后的页仍需从块首顺序解码到该页（LZMA2 无法跳读）；如果 MangaMeeya 的页序与归档顺序不一致（它按文件名排序），跨目录翻页可能触发较长距离的解码。
+- 单个固实块内部的 LZMA2 解码无法多线程化，单块固实包只能单线程解码；多块固实包才会用多个进程并行。
+- 按需解码暂停时会保留一个 `7za.exe` 子进程（持有 LZMA2 字典和缓冲；2.4GB 的包约 800MB 工作集）；MangaMeeya 退出时由 Job Object 结束。
+- `MM7Z_MEMCACHE=1` 的内存缓存是**会话级**的：退出即删除，下次打开重新解码；它不占本进程地址空间，但在系统内存紧张时仍会被缓存管理器写回磁盘。为每个已解码条目保持一个句柄（条目数 > 20000 时自动关闭该功能）。
+- 多块固实包目前仍是“并行预解压所有块”：跳到很靠后的块可能需要等该块所在批次；改为按请求优先级调度可以进一步优化。
 - Susie 的 `fileInfo` 大小字段是 32 位，单个条目 ≥ 4GB 时数值会截断。
 - 右键菜单的注册写入 `HKCU\Software\Classes`，只对当前用户生效；在 Win11 默认菜单中位于“显示更多选项”。进入一级菜单需要 MSIX/IExplorerCommand 包，本补丁未实现。
 - 文件关联设置列表第 5 项（显示为 `....`）不注册（原版会生成无意义的 `HKCR\....`）。
@@ -312,11 +324,15 @@ No administrator rights are required, and Explorer honours the per-user class re
 MangaMeeya's `arc.dll` does not support 7z. A 32-bit Susie archive plug-in, `SusiePlugin/7z.spi`, is added; it calls the bundled `7za.exe` (7-Zip 26.00 x86) located next to it:
 
 - **Non-solid archives** are extracted page by page through `7za x -so`; no cache is built.
-- **Solid archives**: `7za l -slt` reports `Blocks = N` in the header and `Block = k` for every file. LZMA2 decoding is sequential *within* a solid block, but blocks are independent, so the plug-in groups files by block and starts one `7za.exe` process per block (default `min(blocks, CPUs, 8)`, override with `MM7Z_THREADS`). Measured on 131MB / 3 blocks: about 2.7s with one process, versus about 3.8s of total CPU time and about 1.2s wall-clock with three processes.
-- **Page streaming**: files are extracted to `%TEMP%\MangaMeeya_7z\<hash>\` (the hash covers the archive path, size and modification time). `GetFile` waits only for the requested file to appear (size match plus CRC32 verification), so the first page does not wait for the whole archive; the remaining blocks keep decoding in the background as pages are displayed. Measured on a real 176MB / 800-page JPEG manga archive (3 blocks) open in MangaMeeya: the first page returns in about 0.1s, the three blocks finish decoding in about 0.7s, and browsing sequentially to page 800 completes without errors; a warm-cache pass over all 800 pages takes about 1s.
+- **Multi-block solid archives**: `7za l -slt` reports `Blocks = N` in the header and `Block = k` for every file. LZMA2 decoding is sequential *within* a solid block, but blocks are independent, so the plug-in groups files by block and starts one `7za.exe` process per block (default `min(blocks, CPUs, 8)`, override with `MM7Z_THREADS`). Measured on 131MB / 3 blocks: about 2.7s with one process, versus about 3.8s of total CPU time and about 1.2s wall-clock with three processes.
+- **Single-block solid archives are decoded on demand**: when `Blocks = 1` (the common case for manga), the plug-in keeps one `7za x -so` process running, splits its output into files using the sizes from the listing (output is in archive order), and writes them to the cache. `GetFile` only moves the decode frontier to “current page + read-ahead window” (64 MB by default, tunable with `MM7Z_PREFETCH`); with no new requests the decoder **pauses instead of extracting the whole archive in the background**. A requested file is returned as soon as it is complete (size match plus CRC32). Measured on a 1.82GB single-block BallonsTranslator export (2.4GB unpacked): MangaMeeya opens and displays page 64 in about **1.7s** and decoding pauses at about **356MB**; a jump to the last page still requires sequential decoding to that point (about 19s, inherent to one solid block); after a full decode `.done` is written and later opens read the cache directly (about 0.3s). The parallel pre-extraction path for multi-block archives is unchanged.
+- **Cache**: `%TEMP%\MangaMeeya_7z\<hash>\`, where the hash covers the archive path, size and modification time. Complete files are reused on re-decode (their writes are skipped).
+- **Optional session memory cache**: with `MM7Z_MEMCACHE=1`, pages decoded by the single-block stream are created with `FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE` and kept open by a pin handle. The Windows cache manager keeps them in RAM (writing back only under memory pressure), **outside the 32-bit process's address space**, and they are deleted when MangaMeeya exits, leaving nothing in `%TEMP%`. The trade-off is no reuse across sessions (the next open decodes again); under memory pressure data still spills to disk. Off by default (persistent disk cache).
+- **Archive-side advice**: the official way to get fast random access is smaller solid blocks, e.g. `7z a -ms=64m` (use `-ms=16m` for comics). `-ms=64m` split a 200MB test set into 4 blocks, which the plug-in decoded with 4 parallel processes. For fully independent pages use `-ms=off` or a ZIP (natively supported by MangaMeeya).
+- **Cache cap and configuration**: `SusiePlugin\7z.ini` (`[7z]` section); `CacheMaxMB` defaults to **5120 (5 GB)** and 0 disables cleanup. When an archive is opened the plug-in adds up the size of `%TEMP%\MangaMeeya_7z` and, if it is over the cap, deletes the least recently used cache directories; the archive currently open and anything used in the last 10 minutes are kept. The same file also supports `PrefetchMB`, `Threads`, `MemCache` and `Log`; `MM7Z_*` environment variables take precedence. If `7z.ini` is absent, the `[7z]` section of `MangaMeeya.ini` is used.
 - **UTF-8 names**: per-block file lists are passed through `-scsUTF-8` list files, so Japanese/Chinese directory and file names match correctly. This also fixes UTF-8 entry names being compared with `lstrcmpiA`, which under CP936 made `第1巻` and `第2巻` look identical.
 - **Cancellation**: a **non-zero** return from the 00AM `GetFile` progress callback terminates all decoder processes and returns error code 1 (note this is the opposite of the image-filter `GetPicture` convention, where zero cancels); the next read starts a fresh extraction.
-- Diagnostics: `MM7Z_LOG=1` writes startup, listing, block progress and error codes to `%TEMP%\7zspi.log`.
+- Diagnostics: `MM7Z_LOG=1` writes startup, listing, decode pause/completion and error codes to `%TEMP%\7zspi.log`; `MM7Z_PREFETCH=n` sets the single-block read-ahead window in MiB (default 64; 0 means decode only up to the current page).
 
 > Requirement: `7z.spi`, `7za.exe` and `7z-License.txt` must be kept together in `SusiePlugin`. `7za.exe` comes from the official 7-Zip distribution and is covered by the 7-Zip license (`7z-License.txt`).
 > Why not “multi-thread the whole archive”: a single LZMA2 stream must be decoded sequentially from its start, so no decoder can split it across cores. What *can* run in parallel are separate solid blocks. A single-block solid archive therefore still has one decoder thread (but benefits from first-page streaming); multi-block archives gain real multi-core speedup.
@@ -352,6 +368,10 @@ MangaMeeya's `arc.dll` does not support 7z. A 32-bit Susie archive plug-in, `Sus
 | 7z memory-image input (`GetArchiveInfo` / `GetFile` with `flag=1`) | Works |
 | Cancelling during 7z extraction | Decoder processes are terminated and the call returns 1; the next read restarts extraction |
 | **Real 176MB / 800-page / 3-block JPEG manga archive (MangaMeeya GUI)** | Opens at 1/800 and displays; paging through to 800/800 works with no cancellation or errors; all three solid blocks decode in parallel |
+| **1.82GB single-block solid archive (2.4GB unpacked, BallonsTranslator export)** | Opens and displays page 64 in about 1.7s; decoding pauses at about 356MB instead of extracting the whole archive; a jump to the last page completes in about 19s and writes `.done` with all CRCs verified; later opens read the cache directly |
+| First 8 entries of the single-block archive (cold cache) | 1.75s, 285MB cached, log shows `paused`; the rest stays undecoded |
+| Jump to the last page from a partial cache | Completes in 19.2s, 2.4GB, `.done` written, last-page CRC correct |
+| All-empty archive / non-solid / multi-block archives | Regression pass |
 | Register `Folder` / `.zip` in File association settings | `HKCU\Software\Classes\...` command created; the shell enumerates “用MangaMeeya打开” |
 | Register `.jpg` / `.bmp` and other image types | Created under `SystemFileAssociations\<ext>`; visible in the file context menu |
 | Unregister | The corresponding HKCU keys are removed |
@@ -370,8 +390,12 @@ MangaMeeya's `arc.dll` does not support 7z. A 32-bit Susie archive plug-in, `Sus
 - Transparent WebP is flattened onto white (it does not show the viewer background); animated WebP shows only the first frame.
 - If `[Susie] PluginPath` is changed, `webp.spi` must be copied to that folder.
 - The 7z plug-in requires `7za.exe` in the same folder (shipped with the repository); removing or moving it makes 7z archives unopenable. Password-protected 7z archives (including encrypted headers) are not supported.
-- The first open of a solid 7z archive extracts the whole archive to `%TEMP%\MangaMeeya_7z` for caching, which writes roughly as much data as the extracted size. The cache is not cleaned automatically; delete that folder to reclaim space.
-- LZMA2 decoding within one solid block cannot be parallelised, so single-block solid archives use one decoder thread (the first page still arrives early); only multi-block solid archives use multiple parallel processes.
+- Single-block solid archives are decoded on demand: decoding pauses at “current page + read-ahead window” and the cache grows with reading progress. `.done` is written only after a full decode; after that, opens read the cache directly. The cache is not cleaned automatically; delete `%TEMP%\MangaMeeya_7z` to reclaim space.
+- Jumping to a later page in a single-block solid archive still requires sequential decoding from the block start (LZMA2 cannot seek). If MangaMeeya's page order differs from the archive order (it sorts by file name), moving across directory boundaries can trigger a longer decode.
+- LZMA2 decoding within one solid block cannot be parallelised, so single-block solid archives use one decoder thread; only multi-block solid archives use multiple parallel processes.
+- While paused, the on-demand decoder keeps one `7za.exe` child process alive (LZMA2 dictionary plus buffers; about 800MB working set for the 2.4GB example). The Job Object terminates it when MangaMeeya exits.
+- `MM7Z_MEMCACHE=1` memory caching is **session-only**: data is deleted on exit and the next open decodes again. It does not consume this process's address space, but the cache manager will still write it back under memory pressure. One handle is kept per decoded entry (the feature disables itself above 20000 entries).
+- Multi-block solid archives are still pre-extracted eagerly in parallel: a jump to a block late in the archive may wait for its batch. Priority scheduling by request would improve this further.
 - Susie's `fileInfo` size fields are 32-bit; entries ≥ 4GB are truncated.
 - The context menu is registered under `HKCU\Software\Classes`, so it is per-user and appears under “Show more options” on Windows 11. Putting it in the top-level menu requires an MSIX/IExplorerCommand package, which this patch does not provide.
 - The fifth entry in the file-association list (shown as `....`) is not registered (the original created a meaningless `HKCR\....` key).

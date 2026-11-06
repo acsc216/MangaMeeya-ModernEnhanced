@@ -41,6 +41,8 @@ typedef int (WINAPI *PFN_GETFILE)(LPSTR, long, LPSTR, UINT, PROGRESS_CB, long);
 
 static int g_quiet;
 static int g_cb_calls;
+static int g_limit;
+static int g_last_first;
 
 static int __stdcall progress_cb(int num, int denom, long data)
 {
@@ -104,15 +106,37 @@ static int test_file_mode(PFN_GETARCHIVEINFO getinfo, PFN_GETFILEINFO getfileinf
     DWORD t_info = 0, t_file = 0, t_crc = 0, t_scan = 0;
     DWORD t_first = 0, t_slowest = 0;
 
-    if (getinfo((LPSTR)archive, 0, 0, &h) != 0 || !h) {
-        printf("FAIL GetArchiveInfo(%s)\n", archive);
-        return 1;
+    {
+        DWORD tg = GetTickCount();
+        if (getinfo((LPSTR)archive, 0, 0, &h) != 0 || !h) {
+            printf("FAIL GetArchiveInfo(%s)\n", archive);
+            return 1;
+        }
+        tg = GetTickCount() - tg;
+        fi = (FILEINFO*)h;
+        while (fi[n].method[0]) n++;
+        printf("GetArchiveInfo: %d entries (%lu ms)\n", n, tg);
     }
-    fi = (FILEINFO*)h;
-    while (fi[n].method[0]) n++;
-    printf("GetArchiveInfo: %d entries\n", n);
 
-    for (i = 0; i < n; i++) {
+    if (g_last_first && n > 0) {
+        HLOCAL out = NULL;
+        DWORD t = GetTickCount();
+        int rc0 = getfile((LPSTR)archive, (long)fi[n - 1].position, (LPSTR)&out,
+                          0x100, progress_cb, 0);
+        printf("  last page first: rc=%d %lu ms\n", rc0, GetTickCount() - t);
+        if (rc0 != 0 || !out) {
+            fails++;
+        } else {
+            if (fi[n - 1].crc &&
+                crc32_of((const BYTE*)out, fi[n - 1].filesize) != fi[n - 1].crc) {
+                printf("  FAIL CRC (last page)\n");
+                fails++;
+            }
+            LocalFree(out);
+        }
+    }
+
+    for (i = 0; i < n && (!g_limit || i < g_limit); i++) {
         char full[512];
         FILEINFO one;
         HLOCAL out = NULL;
@@ -169,7 +193,7 @@ static int test_file_mode(PFN_GETARCHIVEINFO getinfo, PFN_GETFILEINFO getfileinf
             printf("  ok %-10lu %-8lu %s\n", fi[i].filesize, fi[i].position, full);
         LocalFree(out);
 
-        if (i == 0) {
+        if (i == 0 && fi[i].filesize < 32u * 1024 * 1024) {
             char dir[MAX_PATH];
             WCHAR wdir[MAX_PATH], wleaf[MAX_PATH], wpath[MAX_PATH];
             DWORD n = GetTempPathA(MAX_PATH, dir);
@@ -260,7 +284,7 @@ int main(int argc, char** argv)
     int rc;
 
     if (argc < 3) {
-        printf("usage: %s <7z.spi> <archive.7z> [--mem] [--cancel] [--quiet]\n", argv[0]);
+        printf("usage: %s <7z.spi> <archive.7z> [--mem] [--cancel] [--quiet] [--limit N]\n", argv[0]);
         return 2;
     }
     dllpath = argv[1];
@@ -270,6 +294,8 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--cancel")) want_cancel = 1;
         else if (!strcmp(argv[i], "--cancel-only")) { want_cancel = 1; want_cancel_only = 1; }
         else if (!strcmp(argv[i], "--quiet")) g_quiet = 1;
+        else if (!strcmp(argv[i], "--limit") && i + 1 < argc) g_limit = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--last-first")) g_last_first = 1;
     }
 
     crc_init();
