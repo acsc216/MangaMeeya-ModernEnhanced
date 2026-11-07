@@ -120,6 +120,21 @@ MangaMeeya 的 `arc.dll` 不支持 7z。新增 32 位 Susie 归档插件 `SusieP
 > 依赖：`7z.spi`、`7za.exe`、`7z-License.txt` 必须一起放在 `SusiePlugin`。`7za.exe` 来自 7-Zip 官方发行包，遵循 7-Zip 许可证（见 `7z-License.txt`）。
 > 为什么不能“整包多线程”：7-Zip 作者 Igor Pavlov 明确说明单个 LZMA/LZMA2 流无法多线程解码；LZMA2 虽然可以把流切成独立块，但 7-Zip 的解码端并未实现该并行路径。能并行的是**不同的固实块**（`-ms=64m` 之类的小块），因此单块固实包仍然只有一个解码线程（但具备第一页先到、按需暂停和可选内存缓存），多块固实包才能获得多核加速。
 
+#### 8. SusiePlugin/rar.spi — RAR4 / RAR5 支持（UnRAR）
+
+MangaMeeya 的 `arc.dll` 只支持 2006 年的 RAR 1.5–3.x（RAR4）；WinRAR 5 起的 **RAR5** 会直接返回错误。新增 32 位 Susie 归档插件 `SusiePlugin/rar.spi`，静态链接官方 **UnRAR 7.2.2**：
+
+- **格式**：RAR4、RAR5、固实/非固实、分卷（`.part1.rar` 等）、数据加密和文件名加密（`-hp`）；内部使用 64 位大小与偏移。实测 4.4GB RAR4 包中位于 >4GB 偏移的条目可在 5ms 内读出；
+- **按条目读取**：列表时把 `fileInfo.position` 设为条目 id（与 `7z.spi` 相同的约定），MangaMeeya 之后把该 id 作为 `GetFile` 的 `len` 传回，插件只解码这一条；
+- **固实包顺序解码 + 缓存**：向前请求继续使用同一个 UnRAR 句柄；解码过的每一页写入 `%TEMP%\MangaMeeya_rar\<hash>\<id>.bin`。回跳到已缓存页时直接读文件；目标未缓存时从包首重新解码。默认缓存上限 5GB，打开档案时按 LRU 清理旧目录（当前档案和最近 10 分钟的不删）；
+- **密码框**：加密 RAR 在打开或读取时弹出 **“RAR Password”** 对话框，可手动输入；**“记住密码 / Remember”默认勾选**，密码用 Windows **DPAPI**（当前用户）加密保存在 `%APPDATA%\MangaMeeya_rar\passwords`，下次打开同一路径自动使用；取消勾选会删除该档案已保存的密码，并记住这个选择。密码错误最多重试 3 次；**点击 Cancel 会中止本次打开/预读（视为无法打开），本次打开内不会为后续预读页重复弹框，也不会保存密码；重新打开档案时会再次提示。**
+- **取消与日志**：Susie 进度回调返回非 0 时中止解码并返回 1；`MMRAR_LOG=1` 写 `%TEMP%\rarspi.log`；`MMRAR_PASSWORD` 可用于自动化测试；
+- **配置**：`SusiePlugin\rar.ini` 的 `[rar]` 段支持 `CacheMaxMB`（默认 5120）、`Log`、`RememberPassword`；没有该文件时读取 `MangaMeeya.ini` 的 `[rar]` 段。
+
+**路由补丁**：MangaMeeya 的加载器扩展名表会把 `.rar/.cbr` 直接交给内置 `arc.dll`，不会询问 Susie 插件。`patch-source/patch_mangameeya_rarroute.py` 把表中的 `.cbr/.rar` 改成不匹配任何文件的哨兵（`.cbX/.raX`），使这两类文件回落到 `rar.spi`；`.zip/.cbz/.lzh/.cbl` 不受影响。补丁只改 6 字节，独立于其他 exe 补丁。**应用该补丁后必须保留 `SusiePlugin/rar.spi`，否则 `.rar/.cbr` 将无法打开。**
+
+> 许可证：`rar.spi` 静态链接 RARLab 的 UnRAR 源码，按 UnRAR 许可证分发（见 `SusiePlugin/unrar-License.txt`）：可用于解压 RAR，不得用于开发 RAR 兼容压缩器。构建脚本与源码见 `patch-source/rar/`。
+
 ### 已验证场景
 
 | 场景 | 结果 |
@@ -159,6 +174,14 @@ MangaMeeya 的 `arc.dll` 不支持 7z。新增 32 位 Susie 归档插件 `SusieP
 | 密码含空格（`my pass`） | 正常 |
 | 错误密码 | 最多重试 3 次；取消或超限后放弃打开，不会保存错误密码 |
 | 全空文件包 / 非固实包 / 多块固实包 | 回归通过 |
+| **RAR5 图片包（5 页，MangaMeeya GUI）** | 打开显示 1/5；右键翻页 2/5–4/5、左键回退 3/5 均正常 |
+| **RAR4 图片包（路由补丁后）** | 同上，1/5–4/5 与回退正常 |
+| **RAR5 固实图片包** | 顺序翻页、回跳正常，已解码页从缓存读取 |
+| 数据加密 RAR5（`-pSECRET`） | 列表/解码正常；密码框可见，手动输入后显示首页（1/3）；`MMRAR_PASSWORD` 自动化路径通过 |
+| 文件名加密 RAR5（`-hpSECRET`） | 输入密码后列出 5 条并正常解码 |
+| RAR5 分卷（12 卷，含被拆分的 20KB 随机文件） | 跨卷列表与解码正常，回跳正常 |
+| 4.4GB RAR4，小条目位于 >4GB 偏移 | 列表正常；21 字节末尾条目 5ms 读出 |
+| RAR4 非固实 / 固实（各 8 条） | 顺序、前跳、回跳全部正确 |
 | 文件关联设置勾选 `Folder` / `.zip` 并确定 | `HKCU\Software\Classes\...` 生成 command，Shell 能枚举到“用MangaMeeya打开” |
 | 勾选 `.jpg` / `.bmp` 等图片类型 | `SystemFileAssociations\<ext>` 下生成，对应文件右键菜单可见 |
 | 取消注册 | 对应 HKCU 键被删除 |
@@ -167,8 +190,12 @@ MangaMeeya 的 `arc.dll` 不支持 7z。新增 32 位 Susie 归档插件 `SusieP
 ### 已知限制
 
 - **28000×28000（约 2.35GB DIB）及以上仍会失败。** 32 位进程的 4GB 地址空间被系统 DLL 分成约 1.7GB 和 2.0GB 两个空闲块，无法获得 >2GB 连续 DIB。这是 32 位架构限制；突破需要分块/缩放解码，本补丁未涉及。
-- 只修改了 ZIP 解析；**RAR/LZH 未改动**，超大 RAR 未测试。
-- 未修改 `SusiePlugin`、`AvisynthPlugin` 中的任何插件。
+- RAR 支持由 `SusiePlugin/rar.spi` 提供，并依赖 `MangaMeeya.exe` 的 `.rar/.cbr` 路由补丁。删除 `rar.spi` 会导致 `.rar/.cbr` 无法打开；内置 `arc.dll` 的 RAR4 路径不再被使用。
+- 固实 RAR 只能顺序解码：跳到靠后的页仍需从当前位置（未缓存时从包首）解码到该页，冷缓存下大固实包会较慢；已解码的页面会缓存，回跳很快。RAR 解码是单线程的（UnRAR 本身），非固实包可随机读取。
+- Susie `fileInfo` 的 `filesize`/`compsize` 仍是 32 位；单个条目 ≥4GB 时列表显示为 `0xFFFFFFFF`（页面按 id 读取，不受影响）。单个条目超过 2GB 时会返回内存错误，32 位进程无法分配。
+- 加密 RAR 的密码以**档案完整路径**为键；移动或重命名档案后需要重新输入。密码框的“记住”选择存于 `%APPDATA%\MangaMeeya_rar\remember`，密码存于 `passwords\`，删除该目录即可“忘记”全部密码。
+- 分卷 RAR 使用 UnRAR 的默认卷名推导；卷名不是标准 `.partN.rar` 形式时可能找不到后续卷。
+- 缓存默认上限 5GB（`rar.ini` 的 `CacheMaxMB`），超过后**下次打开档案时**按 LRU 清理，不会在解码过程中实时清理。
 - `mmunicode.dll` 必须与 `MangaMeeya.exe` 放在同一目录。缺失时 Windows 会提示找不到 DLL，程序无法启动。
 - 特殊字符修复只处理“文件名/目录名在当前 ANSI 代码页下不可表示”的情况；程序内部的 ANSI 字符串没有改成 Unicode，因此界面上的特殊字符仍显示为 `?`。
 - `mmunicode.dll` 在进程内挂钩文件 API，少数安全软件可能将其误报；源码公开，可自行审阅或重新编译。
@@ -176,7 +203,7 @@ MangaMeeya 的 `arc.dll` 不支持 7z。新增 32 位 Susie 归档插件 `SusieP
 - WebP 解码依赖系统的 WIC WebP 编解码器。Windows 11 通常自带；Windows 10 如未安装 “WebP Image Extensions”，`webp.spi` 将无法解码并可能显示为空白。
 - 透明 WebP 会合成到白底（不会穿透到 MangaMeeya 的背景色）；动画 WebP 只显示第一帧。
 - 如果用户修改了 `[Susie] PluginPath`，需要把 `webp.spi` 复制到对应目录。
-- 7z 插件依赖同目录的 `7za.exe`（随包附带）；删除或移动它会导致 7z 无法打开。加密的 7z（含加密文件名）不支持。
+- 7z 插件依赖同目录的 `7za.exe`（随包附带）；删除或移动它会导致 7z 无法打开。
 - 单块固实包按需解码：只解到“当前页 + 预读窗口”就暂停，缓存大小随阅读进度增长；完整解码过一次后才会写 `.done`，之后打开可直接读缓存。缓存不会自动清理，可手动删除 `%TEMP%\MangaMeeya_7z`。
 - 单块固实包跳到靠后的页仍需从块首顺序解码到该页（LZMA2 无法跳读）；如果 MangaMeeya 的页序与归档顺序不一致（它按文件名排序），跨目录翻页可能触发较长距离的解码。
 - 单个固实块内部的 LZMA2 解码无法多线程化，单块固实包只能单线程解码；多块固实包才会用多个进程并行。
@@ -205,18 +232,19 @@ MangaMeeya.exe        主程序（已开启 LAA，并导入 mmunicode.dll）
 mmunicode.dll         特殊字符文件名兼容层（新增）
 arc.dll               压缩包插件（已打 ZIP64 补丁）
 gif/jpg/png/jp2/pdf.dll
-SusiePlugin/          原版 Susie 插件 + 新增 webp.spi（WebP 解码）、7z.spi + 7za.exe（7z 解压）
+SusiePlugin/          原版 Susie 插件 + 新增 webp.spi（WebP）、7z.spi + 7za.exe（7z）、
+                      rar.spi + rar.ini + unrar-License.txt（RAR4/RAR5）
 AvisynthPlugin/       原版 Avisynth 插件
 docs/                 原版说明
 MangaMeeya 中文版说明.txt   原中文版作者说明
 original/             未修改的原版 MangaMeeya.exe / arc.dll（对照与回退用）
-patch-source/         补丁源码、应用脚本与预编译补丁块（含 unicode/、webp/、shellmenu/、7z/ 子目录）
+patch-source/         补丁源码、应用脚本与预编译补丁块（含 unicode/、webp/、shellmenu/、7z/、rar/ 子目录）
 SHA256SUMS.txt        补丁版与原版二进制的 SHA-256
 ```
 
 ### 重新打补丁
 
-见 [patch-source/README.md](patch-source/README.md)。需要 Python 3；重新汇编 `arc.dll` 补丁需要 NASM；重新编译 `mmunicode.dll`、`webp.spi` 或 `7z.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。文本页崩溃补丁和右键菜单补丁仅修改 `MangaMeeya.exe` 的机器码，Python 即可完成（右键菜单补丁的 `.bin` 已附带；修改汇编时才需要 NASM）。
+见 [patch-source/README.md](patch-source/README.md)。需要 Python 3；重新汇编 `arc.dll` 补丁需要 NASM；重新编译 `mmunicode.dll`、`webp.spi`、`7z.spi` 或 `rar.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链（`rar.spi` 还需要 `patch-source/rar/unrar/` 中的 UnRAR 源码）。文本页崩溃补丁、右键菜单补丁和 `.rar/.cbr` 路由补丁仅修改机器码，Python 即可完成（右键菜单补丁的 `.bin` 已附带；修改汇编时才需要 NASM）。
 
 ### 隐私
 
@@ -343,6 +371,21 @@ MangaMeeya's `arc.dll` does not support 7z. A 32-bit Susie archive plug-in, `Sus
 > Requirement: `7z.spi`, `7za.exe` and `7z-License.txt` must be kept together in `SusiePlugin`. `7za.exe` comes from the official 7-Zip distribution and is covered by the 7-Zip license (`7z-License.txt`).
 > Why not “multi-thread the whole archive”: a single LZMA2 stream must be decoded sequentially from its start, so no decoder can split it across cores. What *can* run in parallel are separate solid blocks. A single-block solid archive therefore still has one decoder thread (but benefits from first-page streaming); multi-block archives gain real multi-core speedup.
 
+#### 8. SusiePlugin/rar.spi — RAR4 / RAR5 support (UnRAR)
+
+MangaMeeya's `arc.dll` only understands the 2006-era RAR 1.5–3.x format (RAR4); **RAR5** archives (WinRAR 5 and later) fail immediately. A 32-bit Susie archive plug-in, `SusiePlugin/rar.spi`, is added; it statically links the official **UnRAR 7.2.2**:
+
+- **Formats**: RAR4 and RAR5, solid and non-solid, multi-volume (`.part1.rar`, …), data encryption and header encryption (`-hp`). Sizes and offsets are 64-bit internally; a small entry located beyond the 4GB offset in a 4.4GB RAR4 archive was read in 5ms.
+- **Per-entry reads**: `fileInfo.position` is the entry id (the same convention as `7z.spi`); MangaMeeya passes that id back as `GetFile`'s `len`, and only that entry is decoded.
+- **Solid archives** are decoded sequentially on a live UnRAR handle; every decoded page is written to `%TEMP%\MangaMeeya_rar\<hash>\<id>.bin`. Backward jumps to cached pages read the file directly; an uncached target restarts from the beginning. The default cache cap is 5GB and is enforced with LRU cleanup when an archive is opened.
+- **Password dialog**: an encrypted RAR shows a **“RAR Password”** dialog (manual input). **“记住密码 / Remember” is checked by default**; the password is encrypted with Windows **DPAPI** (current user) under `%APPDATA%\MangaMeeya_rar\passwords` and reused for the same archive path. Unchecking removes any saved password and remembers that choice. Up to three attempts are allowed. **Cancel aborts the current open/prefetch (treated as unopenable), suppresses further prompts for the remaining prefetch pages in this open, and saves nothing; reopening the archive prompts again.**
+- **Cancellation/logging**: a non-zero Susie progress callback aborts decoding and returns 1; `MMRAR_LOG=1` writes `%TEMP%\rarspi.log`; `MMRAR_PASSWORD` is available for automation.
+- **Configuration**: `SusiePlugin\rar.ini` (`[rar]`: `CacheMaxMB`, default 5120; `Log`; `RememberPassword`). If absent, the `[rar]` section of `MangaMeeya.ini` is used.
+
+**Routing patch**: MangaMeeya's loader extension table sends `.rar/.cbr` straight to the built-in `arc.dll` without offering them to Susie plug-ins. `patch-source/patch_mangameeya_rarroute.py` changes those two entries to sentinels (`.cbX/.raX`) that match no real file, so `.rar/.cbr` fall through to `rar.spi`; `.zip/.cbz/.lzh/.cbl` are unaffected. The patch changes 6 bytes and is independent of the other executable patches. **After applying it, `SusiePlugin/rar.spi` must be kept; otherwise `.rar/.cbr` cannot be opened.**
+
+> License: `rar.spi` statically links RARLab's UnRAR source and is distributed under the UnRAR license (`SusiePlugin/unrar-License.txt`): it may be used to extract RAR archives, but not to build a RAR-compatible archiver. Sources and the build script are in `patch-source/rar/`.
+
 ### Verified
 
 | Scenario | Result |
@@ -382,6 +425,14 @@ MangaMeeya's `arc.dll` does not support 7z. A 32-bit Susie archive plug-in, `Sus
 | Password containing a space (`my pass`) | Works |
 | Wrong password | Up to three attempts; cancelling or exhausting them aborts opening and does not save the wrong password |
 | All-empty archive / non-solid / multi-block archives | Regression pass |
+| **RAR5 image archive (5 pages, MangaMeeya GUI)** | Opens at 1/5; paging to 2/5–4/5 and back to 3/5 works |
+| **RAR4 image archive (after the routing patch)** | Same, 1/5–4/5 and backward navigation work |
+| **RAR5 solid image archive** | Forward and backward paging work; decoded pages are served from the cache |
+| Data-encrypted RAR5 (`-pSECRET`) | Lists/decodes normally; the password dialog is visible, manual entry renders the first page (1/3); the `MMRAR_PASSWORD` automation path also passes |
+| Header-encrypted RAR5 (`-hpSECRET`) | After the password, all 5 entries list and decode normally |
+| RAR5 multi-volume (12 volumes, including a split 20KB random file) | Cross-volume listing/decoding works; backward jumps work |
+| 4.4GB RAR4, small entry beyond the 4GB offset | Listing works; the 21-byte trailing entry is read in 5ms |
+| RAR4 non-solid / solid (8 entries each) | Forward, skip-ahead and backward reads all correct |
 | Register `Folder` / `.zip` in File association settings | `HKCU\Software\Classes\...` command created; the shell enumerates “用MangaMeeya打开” |
 | Register `.jpg` / `.bmp` and other image types | Created under `SystemFileAssociations\<ext>`; visible in the file context menu |
 | Unregister | The corresponding HKCU keys are removed |
@@ -390,8 +441,12 @@ MangaMeeya's `arc.dll` does not support 7z. A 32-bit Susie archive plug-in, `Sus
 ### Known limitations
 
 - **28000×28000 (about 2.35GB DIB) and larger still fail.** The 4GB address space of a 32-bit process is split by system DLLs into roughly 1.7GB and 2.0GB free blocks, so a contiguous DIB larger than 2GB cannot be allocated. This is a 32-bit architecture limit; overcoming it requires tiled/scaled decoding, which this patch does not attempt.
-- Only ZIP parsing is patched. **RAR/LZH are unchanged**; large RAR archives were not tested.
-- No plugin in `SusiePlugin/` or `AvisynthPlugin/` was modified.
+- RAR support is provided by `SusiePlugin/rar.spi` and depends on the `.rar/.cbr` routing patch in `MangaMeeya.exe`. Removing `rar.spi` makes `.rar/.cbr` unopenable; the built-in `arc.dll` RAR4 path is no longer used.
+- Solid RAR archives can only be decoded sequentially: a jump to a later page still decodes from the current position (or from the start when uncached), so a large cold solid archive is slow. Decoded pages are cached, making backward jumps fast. RAR decoding is single-threaded (UnRAR itself); non-solid archives support random access.
+- Susie `fileInfo.filesize`/`compsize` remain 32-bit; entries ≥4GB are listed as `0xFFFFFFFF` (pages are read by id, so this does not affect normal comic pages). A single entry over 2GB returns a memory error because a 32-bit process cannot allocate it.
+- Encrypted RAR passwords are keyed by the **full archive path**; moving or renaming the archive requires re-entry. The “remember” choice lives in `%APPDATA%\MangaMeeya_rar\remember` and passwords in `passwords\`; delete that directory to forget all passwords.
+- Multi-volume RAR uses UnRAR's default volume-name derivation; non-standard volume names may not be found automatically.
+- The cache cap defaults to 5GB (`rar.ini` `CacheMaxMB`) and is enforced by LRU cleanup **the next time an archive is opened**, not during decoding.
 - `mmunicode.dll` must stay next to `MangaMeeya.exe`. If it is missing, Windows reports that the DLL cannot be found and the program does not start.
 - The special-character fix only addresses characters that are unrepresentable in the ANSI code page. The program's internal strings remain ANSI, so the UI still displays `?`; this is cosmetic. Characters that are illegal in NTFS file names are, of course, not handled.
 - `mmunicode.dll` hooks file APIs inside the process, so a few security products may flag it; the source is included and can be reviewed or rebuilt.
@@ -428,18 +483,19 @@ MangaMeeya.exe        main executable (LAA enabled, imports mmunicode.dll)
 mmunicode.dll         special-character file name compatibility layer (new)
 arc.dll               archive plugin (ZIP64 patched)
 gif/jpg/png/jp2/pdf.dll
-SusiePlugin/          original Susie plugins + new webp.spi (WebP decoder), 7z.spi + 7za.exe (7z)
+SusiePlugin/          original Susie plugins + new webp.spi (WebP), 7z.spi + 7za.exe (7z),
+                      rar.spi + rar.ini + unrar-License.txt (RAR4/RAR5)
 AvisynthPlugin/       original Avisynth plugins
 docs/                 original documentation
 MangaMeeya 中文版说明.txt   original Chinese edition readme
 original/             unmodified MangaMeeya.exe / arc.dll (reference and rollback)
-patch-source/         patch sources, apply scripts and prebuilt blobs (incl. unicode/, webp/, shellmenu/, 7z/)
+patch-source/         patch sources, apply scripts and prebuilt blobs (incl. unicode/, webp/, shellmenu/, 7z/, rar/)
 SHA256SUMS.txt        SHA-256 of patched and original binaries
 ```
 
 ### Rebuilding the patches
 
-See [patch-source/README.md](patch-source/README.md). Python 3 is required; NASM is required only to reassemble the `.asm` files, and a 32-bit (x86) MSVC or MinGW toolchain is required to rebuild `mmunicode.dll` or `webp.spi`. The text-page crash patch and the context-menu patch only rewrite machine code in `MangaMeeya.exe` and need Python only (the context-menu `.bin` is included; NASM is needed only if you modify the assembly). A 32-bit toolchain is also required to rebuild `7z.spi`.
+See [patch-source/README.md](patch-source/README.md). Python 3 is required; NASM is required only to reassemble the `.asm` files, and a 32-bit (x86) MSVC or MinGW toolchain is required to rebuild `mmunicode.dll`, `webp.spi`, `7z.spi` or `rar.spi` (`rar.spi` also needs the UnRAR sources under `patch-source/rar/unrar/`). The text-page crash patch, the context-menu patch and the `.rar/.cbr` routing patch only rewrite machine code and need Python only (the context-menu `.bin` is included; NASM is needed only if you modify the assembly).
 
 ### Privacy
 

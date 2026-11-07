@@ -14,15 +14,18 @@
   - `MangaMeeya.exe` 的 PE `FileHeader.Characteristics` LAA 标志位；
   - `MangaMeeya.exe` 的导入表（新增 `mmunicode.dll!MMUInit`，用于加载文件名兼容层）；
   - `MangaMeeya.exe` 文本页行扫描的越界检查（`.text` 末尾补丁代码 + 一处 5 字节跳转）；
-  - `MangaMeeya.exe` 的 Explorer 右键菜单注册逻辑（检查/写入/删除改为按用户写入 `HKCU\Software\Classes`，无需管理员权限）。
+  - `MangaMeeya.exe` 的 Explorer 右键菜单注册逻辑（检查/写入/删除改为按用户写入 `HKCU\Software\Classes`，无需管理员权限）；
+  - `MangaMeeya.exe` 加载器扩展名表中的 `.rar/.cbr` 两项（改为 `.cbX/.raX`，使这两类文件回落到 Susie 归档插件）。
 - 新增 `mmunicode.dll`（C 源码见 `patch-source/unicode/`），用于解决 ANSI 代码页无法表示的特殊字符文件名；它不修改任何原有代码，只在进程内挂钩文件相关的 ANSI API。
 - 新增 `SusiePlugin/webp.spi`（C 源码见 `patch-source/webp/`），是 32 位 Susie 图像插件，通过 Windows Imaging Component（WIC）解码 WebP。它不修改原有程序或插件，WIC 解码器由操作系统提供。
 - 新增 `SusiePlugin/7z.spi`（C 源码见 `patch-source/7z/`），是 32 位 Susie 归档插件，运行时调用同目录的 `7za.exe` 解压 7z 档案。`7za.exe` 与 `7z-License.txt` 来自 7-Zip 官方发行包，版权归 Igor Pavlov，按 7-Zip 许可证（`SusiePlugin/7z-License.txt`）分发；本仓库未修改 `7za.exe`。
-- 未修改任何第三方插件的代码。
+- 新增 `SusiePlugin/rar.spi`（源码见 `patch-source/rar/`），是 32 位 Susie 归档插件，**静态链接** RARLab 的 UnRAR 7.2.2 源码，提供 RAR4/RAR5、固实、分卷与加密支持。UnRAR 源码及许可证见 `patch-source/rar/unrar/`，运行时许可证副本为 `SusiePlugin/unrar-License.txt`。本仓库未修改 UnRAR 的解压算法。
+- 未修改任何原版第三方插件的代码。
 
 ## 第三方组件
 
 - **7-Zip / 7za.exe**（`SusiePlugin/7za.exe`）：Copyright (c) 1999-2026 Igor Pavlov，按 GNU LGPL、BSD 3-clause 及 unRAR restriction 发布，详见 `SusiePlugin/7z-License.txt` 与 <https://www.7-zip.org/license.txt>。`7z.spi` 仅以独立进程方式调用它，不链接其代码。
+- **UnRAR 7.2.2**（`patch-source/rar/unrar/`，静态链接进 `SusiePlugin/rar.spi`）：Copyright (c) Alexander Roshal / RARLab。许可证允许将 UnRAR 源码用于解压 RAR 档案，但**不得**用于开发 RAR 兼容压缩器或重建 RAR 压缩算法；分发时须保留许可证文本。完整条款见 `SusiePlugin/unrar-License.txt` 与 `patch-source/rar/unrar/license.txt`。
 
 ## 分发
 

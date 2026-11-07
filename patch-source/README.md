@@ -20,10 +20,13 @@
 | `webp/webp.c`、`webp/webp.def` | WebP Susie 图像插件源码（32 位，WIC 解码） |
 | `7z/7z.c`、`7z/7z.def` | 7z Susie 归档插件源码（32 位，调用 7za.exe；固实块并行解压） |
 | `7z/test/test_7zspi.c` | 7z 插件控制台测试程序（校验列表、CRC、内存输入、取消） |
+| `rar/rar.cpp`、`rar/rar.def`、`rar/build.bat` | RAR Susie 归档插件源码（32 位，静态链接 UnRAR 7.2.2） |
+| `rar/unrar/` | 官方 UnRAR 7.2.2 源码（RARLab，见 `license.txt`） |
+| `patch_mangameeya_rarroute.py` | 把加载器表中的 `.rar/.cbr` 改为哨兵，使二者回落到 Susie 插件 |
 
 ## 应用补丁
 
-需要 Python 3；重新汇编 `arc.dll` 补丁或 `shellmenu` 时才需要 NASM；重新编译 `mmunicode.dll` 或 `webp.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。
+需要 Python 3；重新汇编 `arc.dll` 补丁或 `shellmenu` 时才需要 NASM；重新编译 `mmunicode.dll`、`webp.spi`、`7z.spi` 或 `rar.spi` 需要 32 位（x86）MSVC 或 MinGW 工具链。
 
 ```bat
 :: 1) arc.dll（ZIP64）
@@ -39,13 +42,17 @@ python patch_mangameeya_txtcrash.py ..\MangaMeeya.exe.laa ..\MangaMeeya.exe.txtf
 python patch_mangameeya_shellmenu.py ..\MangaMeeya.exe.txtfix ..\MangaMeeya.exe.shellmenu
 
 :: 5) MangaMeeya.exe（新增 mmunicode.dll 导入）
-python patch_mangameeya_unicode.py ..\MangaMeeya.exe.shellmenu ..\MangaMeeya.exe
+python patch_mangameeya_unicode.py ..\MangaMeeya.exe.shellmenu ..\MangaMeeya.exe.unicode
+
+:: 6) MangaMeeya.exe（.rar/.cbr 回落到 Susie 插件）
+python patch_mangameeya_rarroute.py ..\MangaMeeya.exe.unicode ..\MangaMeeya.exe
 ```
 
 `apply_patch.py` 会校验原版字节，只在原始 `arc.dll`（2006-07-19，229376 字节）上工作；已经打过补丁的文件会被拒绝。
 `patch_mangameeya_unicode.py` 通过新增 `.mmuimp` 节来定位，重复执行会被拒绝。
 `patch_mangameeya_txtcrash.py` 校验 `0x531E0` 处的原始指令与 `.text` 尾部空区，重复执行会被拒绝。
-`patch_mangameeya_shellmenu.py` 校验三个 shell 函数的原始字节与 `0xE4700` 空区，重复执行会被拒绝。四个 exe 补丁互不依赖，执行顺序可以互换。
+`patch_mangameeya_shellmenu.py` 校验三个 shell 函数的原始字节与 `0xE4700` 空区，重复执行会被拒绝。
+`patch_mangameeya_rarroute.py` 校验 `.rdata` 中唯一的 `.cbr\0\0\0\0.rar\0\0\0\0` 表项，重复执行会被拒绝。五个 exe 补丁互不依赖，执行顺序可以互换（上面的顺序只是默认流水线）。
 
 ## 重新编译 mmunicode.dll
 
@@ -84,6 +91,7 @@ nasm -f bin zip64_eocd_comment.asm   -o zip64_eocd_comment.bin
 | MangaMeeya.exe | `0x058D50` | `0x458D50` | 右键菜单“检查命令”改为 HKCU，跳入 `0xE476D` |
 | MangaMeeya.exe | `0x058E60` | `0x458E60` | 右键菜单“写入命令”改为 HKCU，跳入 `0xE47F8` |
 | MangaMeeya.exe | `0x058FD0` | `0x458FD0` | 右键菜单“删除命令”改为 HKCU，跳入 `0xE488C` |
+| MangaMeeya.exe | `0x0E5830` | — | 加载器扩展名表 `.cbr/.rar` 改为 `.cbX/.raX` |
 
 arc.dll 的补丁代码写入 `.text` 尾部 `0x10029170`–`0x10029479` 的空白区；该范围在原节表 `SizeOfRawData` 内，不需要修改任何 PE 头。
 
@@ -185,6 +193,45 @@ test_7zspi.exe <7z.spi 的路径> <测试包.7z> [--mem] [--cancel | --cancel-on
 - Susie `fileInfo` 的 `filesize`/`compsize` 是 32 位，单个条目 ≥ 4GB 时数值会截断（MangaMeeya 本身也无法分配这么大的页面）。
 - 缓存默认上限 5 GB（`CacheMaxMB`），超过后下次打开档案时按 LRU 清理旧目录；可把该值设为 0 关闭自动清理。
 - 单块固实档案的解码速度受单线程 LZMA2 限制，这是格式本身决定的。
+
+## 重新编译 rar.spi
+
+`rar/` 是一个 32 位 Susie **归档插件**（`00AM`），静态链接 `rar/unrar/` 中的官方 **UnRAR 7.2.2** 源码。它不是外部进程方案：RAR4/RAR5、固实、加密、分卷都由 UnRAR 库直接处理。
+
+```bat
+cd patch-source\rar
+.\build.bat
+```
+
+`build.bat` 会调用 `vcvars32.bat`，并执行以下三步：
+
+1. 按 UnRAR 官方 `UnRARDll.vcxproj` 的顶层文件列表编译 `unrar\*.cpp`。**不要**把 `unpack50.cpp`、`win32stm.cpp`、`recvol3.cpp`、`uicommon.cpp`、`blake2s_sse.cpp` 等文件单独编译——它们被其他 `.cpp` 包含；重复编译会导致 LNK2005。除 `global.cpp` 外，其余文件使用 `/FIrar.hpp` 强制预编译头。
+2. `global.cpp` **不能**加 `/FIrar.hpp`：它先 `#define INCLUDEGLOBAL` 再包含 `rar.hpp`，否则 `ErrHandler` 会只剩 `extern` 声明。
+3. 编译 `rar.cpp`（插件本身）并链接 `user32.lib crypt32.lib advapi32.lib shell32.lib ole32.lib`。
+
+生成的 `rar.spi` 复制到 `SusiePlugin\`。UnRAR 许可证见 `rar/unrar/license.txt`，运行时随包分发为 `SusiePlugin/unrar-License.txt`。
+
+配置（`SusiePlugin\rar.ini` 的 `[rar]` 段；缺失时读 `MangaMeeya.ini` 的 `[rar]` 段）：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `CacheMaxMB` | `5120` | `%TEMP%\MangaMeeya_rar` 的总量上限（MiB）；0 = 不清理 |
+| `Log` | `0` | 1 = 写 `%TEMP%\rarspi.log` |
+| `RememberPassword` | `1` | 密码框「记住密码」复选框的初始状态 |
+
+环境变量 `MMRAR_LOG=1`、`MMRAR_PASSWORD=...`、`MMRAR_REMEMBER_PASSWORD=0`、`MMRAR_CACHE_MAX_MB=n` 优先于配置文件。
+
+## `.rar/.cbr` 路由补丁（patch_mangameeya_rarroute.py）
+
+MangaMeeya 的加载器扩展名表位于 `MangaMeeya.exe` 文件偏移 `0xE5830`：
+
+```
+.cbr\0\0\0\0.rar\0\0\0\0.cbl\0\0\0\0.lzh\0\0\0\0.cbz\0\0\0\0.zip\0\0\0\0
+```
+
+匹配该表的扩展名会直接交给内置 `arc.dll`，不会再询问 Susie 归档插件。补丁把 `.cbr/.rar` 改为 `.cbX/.raX`（不匹配任何真实文件），这样 `.rar/.cbr` 会回落到 `SusiePlugin\rar.spi`；`.zip/.cbz/.lzh/.cbl` 不受影响。脚本会校验表项唯一存在，重复执行会被拒绝。
+
+> 应用该补丁后必须保留 `SusiePlugin/rar.spi`；否则 `.rar/.cbr` 无法打开。补丁只改 6 字节，独立于其他 exe 补丁。
 
 ## 文本页越界修复（patch_mangameeya_txtcrash.py）
 
